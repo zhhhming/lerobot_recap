@@ -23,7 +23,7 @@ class PicoNeroTeleopConfigBase:
     )
 
     # Main teleop-thread rate (XR poll + IK action-cache updates).
-    ik_hz: int = 80
+    ik_hz: int = 90
     # Internal placo integration step. Keep this independent from ik_hz so the
     # per-iteration joint step size and convergence test are not coupled to the
     # outer teleop loop frequency.
@@ -46,7 +46,7 @@ class PicoNeroTeleopConfigBase:
     trigger_deadzone: float = 0.02
     # Scale trigger -> gripper opening range. 1.0 keeps the calibrated full
     # open/close span; 0.5 limits trigger-released opening to half span.
-    trigger_gripper_scale: float = 1.0
+    trigger_gripper_scale: float = 0.5
 
     # Home / zero behavior. home_button: "Y" (left arm by convention) or "B" (right).
     home_button: str = "Y"

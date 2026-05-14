@@ -24,7 +24,7 @@ class NeroFollowerConfigBase:
     # - "j": move_j
     # - "js": move_js passthrough
     # - "mit": per-joint MIT with gravity compensation
-    control_mode: Literal["j", "js", "mit"] = "j"
+    control_mode: Literal["j", "js", "mit"] = "mit"
 
     # Backward-compat shim. Prefer control_mode.
     use_move_js: bool = False
@@ -35,7 +35,7 @@ class NeroFollowerConfigBase:
     enable_joint_limits: bool = True
 
     # Rate of the background exec thread that forwards the latest target to pyAgxArm.
-    control_hz: int = 80
+    control_hz: int = 90
 
     # Gripper force passed to move_gripper_m (N, range [0, 3]).
     gripper_force_n: float = 1.0

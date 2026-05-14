@@ -197,7 +197,13 @@ class NeroArmDriver:
         if self._effector is None:
             return None
         gs = self._effector.get_gripper_status()
-        return float(gs.msg.value) if gs is not None else None
+        if gs is None:
+            return None
+
+        value = float(gs.msg.value)
+        if getattr(gs.msg, "mode", None) == "angle":
+            value *= 1e-3
+        return float(max(0.0, min(0.1, value)))
 
     def get_arm_status(self):
         return self._robot.get_arm_status()

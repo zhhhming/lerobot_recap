@@ -487,6 +487,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         private: bool = False,
         allow_patterns: list[str] | str | None = None,
         upload_large_folder: bool = False,
+        upload_large_folder_num_workers: int | None = None,
         **card_kwargs,
     ) -> None:
         """Upload the dataset to the Hugging Face Hub.
@@ -507,6 +508,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             allow_patterns: Glob pattern(s) restricting which files to upload.
             upload_large_folder: If ``True``, use ``upload_large_folder`` instead
                 of ``upload_folder`` for very large datasets.
+            upload_large_folder_num_workers: Optional number of workers used by
+                ``upload_large_folder``.
             **card_kwargs: Additional keyword arguments forwarded to dataset card
                 creation.
         """
@@ -539,6 +542,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             "ignore_patterns": ignore_patterns,
         }
         if upload_large_folder:
+            if upload_large_folder_num_workers is not None:
+                upload_kwargs["num_workers"] = upload_large_folder_num_workers
             hub_api.upload_large_folder(**upload_kwargs)
         else:
             hub_api.upload_folder(**upload_kwargs)

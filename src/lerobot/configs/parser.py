@@ -21,9 +21,11 @@ from functools import wraps
 from pathlib import Path
 from pkgutil import ModuleInfo
 from types import ModuleType
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast, get_args, get_origin
 
 import draccus
+from draccus.parsers.decoding import decode
+from draccus.utils import DecodingError
 
 from lerobot.utils.utils import has_method
 
@@ -31,6 +33,19 @@ F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
 PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
+
+
+def _decode_literal(cls, raw_value: Any, path: Sequence[str]) -> Any:
+    allowed_values = get_args(cls)
+    if raw_value in allowed_values:
+        return raw_value
+
+    formatted_values = ", ".join(repr(value) for value in allowed_values)
+    raise DecodingError(path, f"Expected one of {formatted_values}, got {raw_value!r}")
+
+
+if get_origin(Literal["__lerobot_literal_probe__"]) is Literal:
+    decode.register(Literal, _decode_literal, include_subclasses=True)
 
 
 def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> list[str] | None:

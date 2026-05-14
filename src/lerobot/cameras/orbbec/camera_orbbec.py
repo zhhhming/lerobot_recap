@@ -17,7 +17,7 @@ import logging
 import site
 import time
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock
 from typing import Any
 
 import cv2  # type: ignore  # TODO: add type stubs for OpenCV
@@ -76,8 +76,7 @@ class OrbbecCamera(Camera):
         self.serial_number: str | None = None
         self.device_name: str | None = None
 
-        self.thread: Thread | None = None
-        self.stop_event: Event | None = None
+        self.callback_failure_count = 0
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
@@ -114,9 +113,10 @@ class OrbbecCamera(Camera):
         self.pipeline_config = ob.Config()
         self._configure_pipeline()
         self._configure_device_properties()
+        self._configure_capture_settings()
 
         try:
-            self.pipeline.start(self.pipeline_config)
+            self.pipeline.start(self.pipeline_config, self._on_frameset)
         except Exception as e:
             self.pipeline = None
             self.pipeline_config = None
@@ -124,17 +124,18 @@ class OrbbecCamera(Camera):
                 f"Failed to open {self}. Make sure pyorbbecsdk is installed and device permissions are configured."
             ) from e
 
-        self._configure_capture_settings()
-        self._start_read_thread()
-
-        if warmup and self.warmup_s > 0:
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                self.async_read(timeout_ms=self.warmup_s * 1000)
-                time.sleep(0.1)
-            with self.frame_lock:
-                if self.latest_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        try:
+            if warmup and self.warmup_s > 0:
+                start_time = time.time()
+                while time.time() - start_time < self.warmup_s:
+                    self.async_read(timeout_ms=self.warmup_s * 1000)
+                    time.sleep(0.1)
+                with self.frame_lock:
+                    if self.latest_frame is None:
+                        raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        except Exception:
+            self._cleanup_after_failed_connect()
+            raise
 
         logger.info("%s connected.", self)
 
@@ -273,6 +274,11 @@ class OrbbecCamera(Camera):
             return
 
         try:
+            if self._property_is_supported(property_id, ob.OBPermissionType.PERMISSION_READ):
+                current_value = self.device.get_bool_property(property_id)
+                if bool(current_value) == bool(value):
+                    logger.debug("%s already has %s=%s.", self, label, value)
+                    return
             self.device.set_bool_property(property_id, value)
         except Exception as e:
             logger.warning("Failed to set %s for %s: %s", label, self, e)
@@ -286,6 +292,11 @@ class OrbbecCamera(Camera):
             return
 
         try:
+            if self._property_is_supported(property_id, ob.OBPermissionType.PERMISSION_READ):
+                current_value = self.device.get_int_property(property_id)
+                if int(current_value) == int(value):
+                    logger.debug("%s already has %s=%s.", self, label, value)
+                    return
             self.device.set_int_property(property_id, value)
         except Exception as e:
             logger.warning("Failed to set %s for %s: %s", label, self, e)
@@ -326,16 +337,6 @@ class OrbbecCamera(Camera):
         else:
             self.width, self.height = actual_width, actual_height
             self.capture_width, self.capture_height = actual_width, actual_height
-
-    def _read_from_hardware(self) -> Any:
-        if self.pipeline is None:
-            raise RuntimeError(f"{self}: pipeline must be initialized before use.")
-
-        frame = self.pipeline.wait_for_frames(10000)
-        if frame is None:
-            raise RuntimeError(f"{self} read failed (frame is None).")
-
-        return frame
 
     def _decode_color_frame(self, frame: Any) -> NDArray[Any]:
         color_frame = frame.get_color_frame()
@@ -380,8 +381,8 @@ class OrbbecCamera(Camera):
                 f"{self} read() color_mode parameter is deprecated and will be removed in future versions."
             )
 
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
+        if self.pipeline is None:
+            raise RuntimeError(f"{self} pipeline is not running.")
 
         self.new_frame_event.clear()
         frame = self.async_read(timeout_ms=10000)
@@ -417,65 +418,34 @@ class OrbbecCamera(Camera):
 
         return processed_image
 
-    def _read_loop(self) -> None:
-        if self.stop_event is None:
-            raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
+    def _on_frameset(self, frame: Any) -> None:
+        try:
+            color_frame = self._decode_color_frame(frame)
+            processed_frame = self._postprocess_image(color_frame)
+            capture_time = time.perf_counter()
 
-        failure_count = 0
-        while not self.stop_event.is_set():
-            try:
-                frame = self._read_from_hardware()
-                color_frame = self._decode_color_frame(frame)
-                processed_frame = self._postprocess_image(color_frame)
-                capture_time = time.perf_counter()
+            with self.frame_lock:
+                self.latest_frame = processed_frame
+                self.latest_timestamp = capture_time
+            self.new_frame_event.set()
+            self.callback_failure_count = 0
 
-                with self.frame_lock:
-                    self.latest_frame = processed_frame
-                    self.latest_timestamp = capture_time
-                self.new_frame_event.set()
-                failure_count = 0
-
-            except DeviceNotConnectedError:
-                break
-            except Exception as e:
-                if failure_count <= 10:
-                    failure_count += 1
-                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
-
-    def _start_read_thread(self) -> None:
-        self._stop_read_thread()
-
-        self.stop_event = Event()
-        self.thread = Thread(target=self._read_loop, args=(), name=f"{self}_read_loop")
-        self.thread.daemon = True
-        self.thread.start()
-
-    def _stop_read_thread(self) -> None:
-        if self.stop_event is not None:
-            self.stop_event.set()
-
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-
-        self.thread = None
-        self.stop_event = None
-
-        with self.frame_lock:
-            self.latest_frame = None
-            self.latest_timestamp = None
-            self.new_frame_event.clear()
+        except Exception as e:
+            if self.callback_failure_count <= 10:
+                self.callback_failure_count += 1
+                logger.warning(f"Error reading frame in callback for {self}: {e}")
+            else:
+                logger.exception("%s exceeded maximum consecutive callback read failures.", self)
 
     @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
+        if self.pipeline is None:
+            raise RuntimeError(f"{self} pipeline is not running.")
 
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
-                f"Read thread alive: {self.thread.is_alive()}."
+                f"Callback failures: {self.callback_failure_count}."
             )
 
         with self.frame_lock:
@@ -489,8 +459,8 @@ class OrbbecCamera(Camera):
 
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
+        if self.pipeline is None:
+            raise RuntimeError(f"{self} pipeline is not running.")
 
         with self.frame_lock:
             frame = self.latest_frame
@@ -507,12 +477,26 @@ class OrbbecCamera(Camera):
 
         return frame
 
-    def disconnect(self) -> None:
-        if not self.is_connected and self.thread is None:
-            raise DeviceNotConnectedError(f"{self} not connected.")
+    def _cleanup_after_failed_connect(self) -> None:
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                logger.exception("Failed to stop %s after connection failure.", self)
 
-        if self.thread is not None:
-            self._stop_read_thread()
+        self.pipeline = None
+        self.pipeline_config = None
+        self.color_profile = None
+        self.device = None
+
+        with self.frame_lock:
+            self.latest_frame = None
+            self.latest_timestamp = None
+            self.new_frame_event.clear()
+
+    def disconnect(self) -> None:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} not connected.")
 
         if self.pipeline is not None:
             self.pipeline.stop()
@@ -521,6 +505,7 @@ class OrbbecCamera(Camera):
         self.pipeline_config = None
         self.color_profile = None
         self.device = None
+        self.callback_failure_count = 0
 
         with self.frame_lock:
             self.latest_frame = None

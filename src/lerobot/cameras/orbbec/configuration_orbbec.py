@@ -28,7 +28,7 @@ class OrbbecCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
-    auto_exposure: bool = False
+    auto_exposure: bool = True
     exposure: int = 300
 
     def __post_init__(self) -> None:

@@ -4,12 +4,16 @@
 
 import logging
 import math
+import os
+import select
+import shutil
+import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any, Literal
 
 import torch
@@ -25,6 +29,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.utils import INFO_PATH
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.inference_engines import RTCInferenceEngine, SyncInferenceEngine
 from lerobot.inference_engines.robot_wrapper import ThreadSafeRobot
@@ -34,9 +39,8 @@ from lerobot.processor import make_default_processors
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import RobotConfig, make_robot_from_config
 from lerobot.teleoperators import TeleoperatorConfig, make_teleoperator_from_config
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import (
-    is_headless,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
@@ -87,11 +91,14 @@ LoopState = Literal["waiting", "preparing", "recording", "paused"]
 @dataclass
 class HILRecordDatasetConfig:
     repo_id: str
-    single_task: str
+    single_task: str = (
+        "Pick up the match in front, strike it to light it, then use it to light the small candle "
+        "on the cake in front."
+    )
     root: str | Path | None = None
     fps: int = 30
     video: bool = True
-    push_to_hub: bool = True
+    push_to_hub: bool = False
     private: bool = False
     tags: list[str] | None = None
     num_image_writer_processes: int = 0
@@ -102,6 +109,7 @@ class HILRecordDatasetConfig:
     encoder_queue_maxsize: int = 30
     encoder_threads: int | None = None
     rename_map: dict[str, str] = field(default_factory=dict)
+    force: bool = False
 
     def __post_init__(self):
         if self.single_task is None:
@@ -119,10 +127,10 @@ class HILRecordConfig:
     rtc: RTCConfig = field(default_factory=RTCConfig)
     rtc_queue_threshold: int = 40
     interpolation_multiplier: int = 1
-    control_multiplier: int | None = None
+    control_multiplier: int | None = 3
     control_hz: float | None = None
-    smoother_alpha: float = 0.3
-    display_data: bool = False
+    smoother_alpha: float = 0.2
+    display_data: bool = True
     display_ip: str | None = None
     display_port: int | None = None
     display_compressed_images: bool = False
@@ -148,6 +156,8 @@ class HILRecordConfig:
             raise ValueError("--control_hz must be > 0.")
         if not 0 < self.smoother_alpha <= 1:
             raise ValueError("--smoother_alpha must be in (0, 1].")
+        if self.resume and self.dataset.force:
+            raise ValueError("--dataset.force cannot be used with --resume.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -172,31 +182,157 @@ class KeyboardEvents:
         return event
 
 
-def _init_keyboard_listener(events: KeyboardEvents):
-    if is_headless():
-        logger.warning("Headless environment detected. Keyboard control is disabled.")
+class _TerminalKeyboardListener:
+    _ESCAPE_SEQUENCE_TIMEOUT_S = 0.1
+    _MAX_ESCAPE_SEQUENCE_CHARS = 12
+    _ESCAPE_SEQUENCES = {
+        "\x1b[C": "right",
+        "\x1bOC": "right",
+        "\x1b[D": "left",
+        "\x1bOD": "left",
+    }
+    _SINGLE_CHAR_EVENTS = {
+        "\r": "enter",
+        "\n": "enter",
+        " ": "space",
+        "\x1b": "esc",
+        "q": "q",
+        "e": "e",
+    }
+
+    def __init__(self, events: KeyboardEvents, stdin=None) -> None:
+        self._events = events
+        self._stdin = stdin if stdin is not None else sys.stdin
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+        self._old_termios = None
+        self._fd: int | None = None
+
+    @classmethod
+    def parse_key(cls, text: str) -> str | None:
+        if text in cls._ESCAPE_SEQUENCES:
+            return cls._ESCAPE_SEQUENCES[text]
+        if (text.startswith("\x1b[") or text.startswith("\x1bO")) and len(text) >= 3:
+            if text[-1] == "C":
+                return "right"
+            if text[-1] == "D":
+                return "left"
+        if text in cls._SINGLE_CHAR_EVENTS:
+            return cls._SINGLE_CHAR_EVENTS[text]
         return None
 
-    from pynput import keyboard
+    def start(self) -> bool:
+        if not hasattr(self._stdin, "isatty") or not self._stdin.isatty():
+            return False
 
-    def on_press(key):
-        if key == keyboard.Key.right:
-            events.push("right")
-        elif key == keyboard.Key.left:
-            events.push("left")
-        elif key == keyboard.Key.enter:
-            events.push("enter")
-        elif key == keyboard.Key.space:
-            events.push("space")
-        elif key == keyboard.Key.esc:
-            events.push("esc")
-        elif hasattr(key, "char") and key.char in ("q", "e"):
-            events.push(key.char)
+        try:
+            import termios
+            import tty
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    logger.info("Keyboard: right=start/confirm, enter=save, left=cancel, space=pause, q=policy, e=teleop, esc=exit")
-    return listener
+            fd = self._stdin.fileno()
+            self._fd = fd
+            self._old_termios = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            logger.exception("Failed to enable terminal keyboard control.")
+            return False
+
+        self._thread = Thread(target=self._run, name="hil-terminal-keyboard-listener", daemon=True)
+        self._thread.start()
+        logger.info("Terminal keyboard control enabled.")
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+        if self._old_termios is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_termios)
+            except Exception:
+                logger.exception("Failed to restore terminal settings.")
+            self._old_termios = None
+        self._fd = None
+
+    def _read_char(self) -> str:
+        if self._fd is None:
+            return ""
+        return os.read(self._fd, 1).decode(errors="ignore")
+
+    def _read_available_escape_sequence(self, first_char: str) -> str:
+        if self._fd is None:
+            return first_char
+        chars = [first_char]
+        deadline = time.monotonic() + self._ESCAPE_SEQUENCE_TIMEOUT_S
+        while len(chars) < self._MAX_ESCAPE_SEQUENCE_CHARS and not self._stop_event.is_set():
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                break
+            readable, _, _ = select.select([self._fd], [], [], timeout)
+            if not readable:
+                break
+            chars.append(self._read_char())
+            if len(chars) >= 3 and (chars[-1].isalpha() or chars[-1] == "~"):
+                break
+        return "".join(chars)
+
+    def _run(self) -> None:
+        while self._fd is not None and not self._stop_event.is_set():
+            readable, _, _ = select.select([self._fd], [], [], 0.05)
+            if not readable:
+                continue
+            text = self._read_char()
+            if not text:
+                continue
+            if text == "\x1b":
+                text = self._read_available_escape_sequence(text)
+            event = self.parse_key(text)
+            if text.startswith("\x1b"):
+                logger.info("Keyboard escape sequence: %r", text)
+            if event is not None:
+                logger.info("Keyboard event: %s", event)
+                self._events.push(event)
+
+
+def _init_keyboard_listener(events: KeyboardEvents):
+    terminal_listener = _TerminalKeyboardListener(events)
+    if terminal_listener.start():
+        logger.info(
+            "Keyboard: right=start/confirm, enter=save, left=cancel, space=pause, q=policy, e=teleop, esc=exit"
+        )
+        return terminal_listener
+
+    try:
+        from pynput import keyboard
+
+        def on_press(key):
+            if key == keyboard.Key.right:
+                events.push("right")
+            elif key == keyboard.Key.left:
+                events.push("left")
+            elif key == keyboard.Key.enter:
+                events.push("enter")
+            elif key == keyboard.Key.space:
+                events.push("space")
+            elif key == keyboard.Key.esc:
+                events.push("esc")
+            elif hasattr(key, "char") and key.char in ("q", "e"):
+                events.push(key.char)
+
+        pynput_listener = keyboard.Listener(on_press=on_press)
+        pynput_listener.start()
+        logger.info("pynput keyboard control enabled.")
+        logger.info(
+            "Keyboard: right=start/confirm, enter=save, left=cancel, space=pause, q=policy, e=teleop, esc=exit"
+        )
+        return pynput_listener
+    except Exception as exc:
+        logger.warning("pynput keyboard control unavailable: %s", exc)
+
+    logger.warning("Keyboard control is disabled because neither terminal stdin nor pynput is available.")
+    return None
 
 
 def _ordered_action_keys(dataset_features: dict) -> list[str]:
@@ -216,6 +352,33 @@ def _clamp_policy_action(action: dict[str, float]) -> dict[str, float]:
         if "gripper" in key.lower():
             out[key] = float(max(0.0, min(0.1, value)))
     return out
+
+
+def _resolve_dataset_root(repo_id: str, root: str | Path | None) -> Path:
+    return Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+
+
+def _is_safe_to_remove_dataset_root(root: Path) -> bool:
+    if root.is_symlink() or not root.is_dir():
+        return False
+    try:
+        next(root.iterdir())
+    except StopIteration:
+        return True
+    return (root / INFO_PATH).is_file()
+
+
+def _remove_dataset_root(root: Path, *, reason: str) -> None:
+    if not root.exists():
+        return
+    if not _is_safe_to_remove_dataset_root(root):
+        raise FileExistsError(
+            f"Refusing to remove existing directory '{root}'. "
+            f"{reason} only removes empty directories or LeRobot dataset directories "
+            f"containing '{INFO_PATH}'."
+        )
+    logger.warning("Removing dataset directory '%s' (%s).", root, reason)
+    shutil.rmtree(root)
 
 
 def _resolve_control_rate(cfg: HILRecordConfig) -> tuple[float, int]:
@@ -591,6 +754,7 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
     listener = None
     engine = None
     inference_shutdown_event = Event()
+    created_dataset_root = None
 
     try:
         num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
@@ -612,21 +776,31 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             sanity_check_dataset_name(cfg.dataset.repo_id, policy_cfg)
-            dataset = LeRobotDataset.create(
-                cfg.dataset.repo_id,
-                cfg.dataset.fps,
-                root=cfg.dataset.root,
-                robot_type=robot.name,
-                features=dataset_features,
-                use_videos=cfg.dataset.video,
-                image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras,
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                vcodec=cfg.dataset.vcodec,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-            )
+            dataset_root = _resolve_dataset_root(cfg.dataset.repo_id, cfg.dataset.root)
+            if cfg.dataset.force:
+                _remove_dataset_root(dataset_root, reason="--dataset.force was set")
+            dataset_root_existed_before_create = dataset_root.exists()
+            try:
+                dataset = LeRobotDataset.create(
+                    cfg.dataset.repo_id,
+                    cfg.dataset.fps,
+                    root=cfg.dataset.root,
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                )
+            except Exception:
+                if not dataset_root_existed_before_create and dataset_root.exists():
+                    _remove_dataset_root(dataset_root, reason="HIL dataset creation failed")
+                raise
+            created_dataset_root = dataset.root
 
         policy = None
         preprocessor = postprocessor = None
@@ -922,6 +1096,11 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                     logger.exception("Failed to push dataset to the Hugging Face Hub.")
             else:
                 logger.info("Skipping Hub push because no episodes were recorded.")
+        if dataset is not None and created_dataset_root is not None and dataset.num_episodes == 0:
+            try:
+                _remove_dataset_root(created_dataset_root, reason="no episodes were recorded")
+            except Exception:
+                logger.exception("Failed to remove empty HIL dataset directory '%s'.", created_dataset_root)
 
     return dataset
 

@@ -204,6 +204,8 @@ class DatasetWriter:
                     episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
                 )
                 if frame_index == 0:
+                    if img_path.parent.is_dir():
+                        shutil.rmtree(img_path.parent)
                     img_path.parent.mkdir(parents=True, exist_ok=True)
                 compress_level = 1 if self._meta.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
@@ -526,7 +528,7 @@ class DatasetWriter:
             # save_episode() mutates the buffer. Handle both types here.
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self._meta.image_keys:
+            for cam_key in {*self._meta.image_keys, *self._meta.video_keys}:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)

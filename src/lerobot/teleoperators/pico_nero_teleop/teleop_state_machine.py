@@ -31,7 +31,7 @@ class TeleopStateMachine:
         release_threshold: float = 0.5,
         home_speed_rad_s: float = 0.4,
         home_joints_rad: list[float] | None = None,
-        ik_hz: int = 80,
+        ik_hz: int = 90,
     ) -> None:
         self.side = side
         self.activation_threshold = float(activation_threshold)
