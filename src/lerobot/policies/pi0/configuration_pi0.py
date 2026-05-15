@@ -26,6 +26,20 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_IMAGE_SIZE = 224
 
 
+@dataclass
+class PI0ImageAugmentationConfig:
+    """OpenPI-style training-time image augmentation for PI0."""
+
+    enable: bool = True
+    probability: float = 0.9
+    crop_scale: float = 0.95
+    rotation_degrees: float = 5.0
+    brightness: float = 0.3
+    contrast: float = 0.4
+    saturation: float = 0.5
+    apply_geometry_to_wrist: bool = False
+
+
 @PreTrainedConfig.register_subclass("pi0")
 @dataclass
 class PI0Config(PreTrainedConfig):
@@ -64,6 +78,7 @@ class PI0Config(PreTrainedConfig):
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,
     )  # see openpi `preprocessing_pytorch.py`
+    image_augmentation: PI0ImageAugmentationConfig = field(default_factory=PI0ImageAugmentationConfig)
 
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
@@ -120,6 +135,29 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if not 0.0 <= self.image_augmentation.probability <= 1.0:
+            raise ValueError(
+                "image_augmentation.probability must be in [0, 1], "
+                f"got {self.image_augmentation.probability}"
+            )
+
+        if not 0.0 < self.image_augmentation.crop_scale <= 1.0:
+            raise ValueError(
+                "image_augmentation.crop_scale must be in (0, 1], "
+                f"got {self.image_augmentation.crop_scale}"
+            )
+
+        if self.image_augmentation.rotation_degrees < 0.0:
+            raise ValueError(
+                "image_augmentation.rotation_degrees must be non-negative, "
+                f"got {self.image_augmentation.rotation_degrees}"
+            )
+
+        for name in ("brightness", "contrast", "saturation"):
+            value = getattr(self.image_augmentation, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"image_augmentation.{name} must be in [0, 1], got {value}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

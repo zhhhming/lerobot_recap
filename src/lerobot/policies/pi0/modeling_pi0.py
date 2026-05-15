@@ -225,6 +225,91 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
+def _apply_affine_to_channels_last_images(
+    images: torch.Tensor,
+    theta: torch.Tensor,
+) -> torch.Tensor:
+    """Apply an affine transform to [B, H, W, C] images and keep the same layout."""
+    images_chw = images.permute(0, 3, 1, 2)
+    grid = F.affine_grid(theta, size=images_chw.shape, align_corners=False)
+    images_chw = F.grid_sample(
+        images_chw,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    )
+    return images_chw.permute(0, 2, 3, 1)
+
+
+def _random_resized_crop_channels_last(images: torch.Tensor, scale: float) -> torch.Tensor:
+    if scale >= 1.0:
+        return images
+
+    batch_size = images.shape[0]
+    theta = torch.zeros(batch_size, 2, 3, dtype=images.dtype, device=images.device)
+    theta[:, 0, 0] = scale
+    theta[:, 1, 1] = scale
+
+    max_shift = 1.0 - scale
+    theta[:, 0, 2] = (torch.rand(batch_size, dtype=images.dtype, device=images.device) * 2 - 1) * max_shift
+    theta[:, 1, 2] = (torch.rand(batch_size, dtype=images.dtype, device=images.device) * 2 - 1) * max_shift
+
+    return _apply_affine_to_channels_last_images(images, theta)
+
+
+def _random_rotate_channels_last(images: torch.Tensor, degrees: float) -> torch.Tensor:
+    if degrees <= 0.0:
+        return images
+
+    batch_size = images.shape[0]
+    angles = (torch.rand(batch_size, dtype=images.dtype, device=images.device) * 2 - 1) * degrees
+    angles = angles * math.pi / 180.0
+    cos_a = torch.cos(angles)
+    sin_a = torch.sin(angles)
+
+    theta = torch.zeros(batch_size, 2, 3, dtype=images.dtype, device=images.device)
+    theta[:, 0, 0] = cos_a
+    theta[:, 0, 1] = -sin_a
+    theta[:, 1, 0] = sin_a
+    theta[:, 1, 1] = cos_a
+
+    return _apply_affine_to_channels_last_images(images, theta)
+
+
+def _color_jitter_channels_last(
+    images: torch.Tensor,
+    *,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+) -> torch.Tensor:
+    batch_size = images.shape[0]
+    broadcast_shape = (batch_size, 1, 1, 1)
+
+    if brightness > 0.0:
+        factor = 1.0 + (
+            torch.rand(broadcast_shape, dtype=images.dtype, device=images.device) * 2 - 1
+        ) * brightness
+        images = images * factor
+
+    if contrast > 0.0:
+        factor = 1.0 + (
+            torch.rand(broadcast_shape, dtype=images.dtype, device=images.device) * 2 - 1
+        ) * contrast
+        mean = images.mean(dim=(1, 2, 3), keepdim=True)
+        images = (images - mean) * factor + mean
+
+    if saturation > 0.0:
+        factor = 1.0 + (
+            torch.rand(broadcast_shape, dtype=images.dtype, device=images.device) * 2 - 1
+        ) * saturation
+        gray = images.mean(dim=-1, keepdim=True)
+        images = gray + (images - gray) * factor
+
+    return images.clamp(0.0, 1.0)
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -1164,7 +1249,30 @@ class PI0Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    def _augment_image(self, img: Tensor, key: str) -> Tensor:
+        augmentation = self.config.image_augmentation
+        if not augmentation.enable:
+            return img
+
+        if augmentation.probability < 1.0:
+            should_apply = torch.rand((), device=img.device) < augmentation.probability
+            if not bool(should_apply.item()):
+                return img
+
+        if augmentation.apply_geometry_to_wrist or "wrist" not in key:
+            img = _random_resized_crop_channels_last(img, augmentation.crop_scale)
+            img = _random_rotate_channels_last(img, augmentation.rotation_degrees)
+
+        return _color_jitter_channels_last(
+            img,
+            brightness=augmentation.brightness,
+            contrast=augmentation.contrast,
+            saturation=augmentation.saturation,
+        )
+
+    def _preprocess_images(
+        self, batch: dict[str, Tensor], train: bool | None = None
+    ) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
@@ -1206,6 +1314,10 @@ class PI0Policy(PreTrainedPolicy):
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+            apply_train_transforms = self.training if train is None else train
+            if apply_train_transforms:
+                img = self._augment_image(img, key)
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
