@@ -476,12 +476,16 @@ class PicoNeroTeleop(Teleoperator):
         if state == TeleopState.IDLE:
             self._ik_fail_count = 0
             self._mapper.reset()
-            if self._hold_cached_action_in_idle:
+            if self._last_raw_q_target is not None:
                 q_cmd = self._get_cached_raw_action(q_now)
-                note = "idle_hold_cached_command"
+                note = (
+                    "idle_hold_cached_command"
+                    if self._hold_cached_action_in_idle
+                    else "idle_hold_last_command"
+                )
             else:
                 q_cmd = q_now.copy()
-                note = "idle_hold_current"
+                note = "idle_seed_current"
             self._store_raw_action(q_cmd)
             self._last_q_target = q_cmd.copy()
             self._publish_action(q_cmd, g_target_m)

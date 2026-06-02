@@ -61,10 +61,19 @@ class RTCInferenceEngine(InferenceEngine):
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
         self._obs_lock = Lock()
+        self._state_lock = Lock()
+        self._inference_lock = Lock()
         self._policy_active = Event()
         self._shutdown_event = Event()
         self._rtc_error = Event()
         self._rtc_thread: Thread | None = None
+        self._reset_version = 0
+        self._last_latency_s: float | None = None
+        self._last_real_delay: int | None = None
+        self._last_queue_size: int = 0
+        self._last_timing_ms: dict[str, float] = {}
+        self._inference_count = 0
+        self._phase_info: tuple[str, float] = ("init", time.perf_counter())
 
         self._relative_step = next(
             (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
@@ -102,11 +111,16 @@ class RTCInferenceEngine(InferenceEngine):
         self._policy_active.set()
 
     def reset(self) -> None:
-        self._policy.reset()
-        self._preprocessor.reset()
-        self._postprocessor.reset()
-        if self._action_queue is not None:
-            self._action_queue.clear()
+        with self._state_lock:
+            self._reset_version += 1
+            if self._action_queue is not None:
+                self._action_queue.clear()
+        with self._obs_lock:
+            self._obs_holder["obs"] = None
+        with self._inference_lock:
+            self._policy.reset()
+            self._preprocessor.reset()
+            self._postprocessor.reset()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         _ = obs_frame
@@ -118,6 +132,24 @@ class RTCInferenceEngine(InferenceEngine):
         with self._obs_lock:
             self._obs_holder["obs"] = obs
 
+    def debug_snapshot(self) -> dict[str, Any]:
+        queue = self._action_queue
+        phase_name, phase_start = self._phase_info
+        phase_duration_ms = (time.perf_counter() - phase_start) * 1e3
+        with self._state_lock:
+            return {
+                "queue_size": queue.qsize() if queue is not None else 0,
+                "last_latency_s": self._last_latency_s,
+                "last_real_delay": self._last_real_delay,
+                "last_queue_size": self._last_queue_size,
+                "last_timing_ms": dict(self._last_timing_ms),
+                "inference_count": self._inference_count,
+                "active": self._policy_active.is_set(),
+                "failed": self.failed,
+                "current_phase": phase_name,
+                "current_phase_duration_ms": round(phase_duration_ms, 1),
+            }
+
     def _rtc_loop(self) -> None:
         try:
             latency_tracker = LatencyTracker()
@@ -127,6 +159,7 @@ class RTCInferenceEngine(InferenceEngine):
 
             while not self._shutdown_event.is_set():
                 if not self._policy_active.is_set():
+                    self._phase_info = ("idle_paused", time.perf_counter())
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
@@ -134,10 +167,12 @@ class RTCInferenceEngine(InferenceEngine):
                 with self._obs_lock:
                     obs = self._obs_holder.get("obs")
                 if queue is None or obs is None:
+                    self._phase_info = ("idle_no_obs", time.perf_counter())
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
                 if queue.qsize() > self._rtc_queue_threshold:
+                    self._phase_info = ("idle_queue_full", time.perf_counter())
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
@@ -145,48 +180,89 @@ class RTCInferenceEngine(InferenceEngine):
                     current_time = time.perf_counter()
                     idx_before = queue.get_action_index()
                     prev_actions = None
+                    with self._state_lock:
+                        reset_version = self._reset_version
 
                     latency = latency_tracker.max()
                     delay = math.ceil(latency / time_per_chunk) if latency else 0
+                    timings: dict[str, float] = {}
 
-                    obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
-                    obs_batch = prepare_observation_for_inference(
-                        obs_batch,
-                        policy_device,
-                        self._task,
-                        self._robot.robot_type,
-                    )
-                    obs_batch["task"] = [self._task]
+                    with self._inference_lock:
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("build_frame", stage_start)
+                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                        timings["build_frame"] = time.perf_counter() - stage_start
 
-                    preprocessed = self._preprocessor(obs_batch)
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("prepare_obs", stage_start)
+                        obs_batch = prepare_observation_for_inference(
+                            obs_batch,
+                            policy_device,
+                            self._task,
+                            self._robot.robot_type,
+                        )
+                        obs_batch["task"] = [self._task]
+                        timings["prepare_obs"] = time.perf_counter() - stage_start
 
-                    if self._relative_step is not None:
-                        prev_abs = queue.get_processed_left_over()
-                        raw_state = self._relative_step._last_state
-                        if prev_abs is not None and prev_abs.numel() > 0 and raw_state is not None:
-                            prev_actions = reanchor_relative_rtc_prefix(
-                                prev_actions_absolute=prev_abs,
-                                current_state=raw_state,
-                                relative_step=self._relative_step,
-                                normalizer_step=self._normalizer_step,
-                                policy_device=policy_device,
-                            )
-                    else:
-                        prev_actions = queue.get_left_over()
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("preprocess", stage_start)
+                        preprocessed = self._preprocessor(obs_batch)
+                        timings["preprocess"] = time.perf_counter() - stage_start
 
-                    actions = self._policy.predict_action_chunk(
-                        preprocessed,
-                        inference_delay=delay,
-                        prev_chunk_left_over=prev_actions,
-                    )
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("leftover", stage_start)
+                        if self._relative_step is not None:
+                            prev_abs = queue.get_processed_left_over()
+                            raw_state = self._relative_step._last_state
+                            if prev_abs is not None and prev_abs.numel() > 0 and raw_state is not None:
+                                prev_actions = reanchor_relative_rtc_prefix(
+                                    prev_actions_absolute=prev_abs,
+                                    current_state=raw_state,
+                                    relative_step=self._relative_step,
+                                    normalizer_step=self._normalizer_step,
+                                    policy_device=policy_device,
+                                )
+                        else:
+                            prev_actions = queue.get_left_over()
+                        timings["leftover"] = time.perf_counter() - stage_start
 
-                    original = actions.squeeze(0).clone()
-                    processed = self._postprocessor(actions).squeeze(0)
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("predict", stage_start)
+                        actions = self._policy.predict_action_chunk(
+                            preprocessed,
+                            inference_delay=delay,
+                            prev_chunk_left_over=prev_actions,
+                        )
+                        timings["predict"] = time.perf_counter() - stage_start
+
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("postprocess", stage_start)
+                        original = actions.squeeze(0).clone()
+                        processed = self._postprocessor(actions).squeeze(0)
+                        timings["postprocess"] = time.perf_counter() - stage_start
                     new_latency = time.perf_counter() - current_time
                     real_delay = max(0, queue.get_action_index() - idx_before)
 
-                    latency_tracker.add(new_latency)
-                    queue.merge(original, processed, real_delay, idx_before)
+                    with self._state_lock:
+                        if (
+                            self._shutdown_event.is_set()
+                            or not self._policy_active.is_set()
+                            or reset_version != self._reset_version
+                        ):
+                            self._phase_info = ("idle_reset", time.perf_counter())
+                            continue
+                        latency_tracker.add(new_latency)
+                        stage_start = time.perf_counter()
+                        self._phase_info = ("merge", stage_start)
+                        queue.merge(original, processed, real_delay, idx_before)
+                        timings["merge"] = time.perf_counter() - stage_start
+                        timings["total"] = new_latency
+                        self._last_latency_s = new_latency
+                        self._last_real_delay = real_delay
+                        self._last_queue_size = queue.qsize()
+                        self._last_timing_ms = {key: value * 1e3 for key, value in timings.items()}
+                        self._inference_count += 1
+                    self._phase_info = ("between_inferences", time.perf_counter())
                     consecutive_errors = 0
                 except Exception as e:
                     consecutive_errors += 1

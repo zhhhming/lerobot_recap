@@ -8,6 +8,15 @@ Usage:
     python scripts/nero_teleop/run_bi_teleop.py --xr-yaw-quadrants 1
 """
 
+import os
+
+_no_proxy = os.environ.get("no_proxy", "")
+for _host in ("127.0.0.1", "localhost"):
+    if _host not in _no_proxy.split(","):
+        _no_proxy = (_no_proxy + "," + _host).strip(",")
+os.environ["no_proxy"] = _no_proxy
+os.environ["NO_PROXY"] = _no_proxy
+
 import argparse
 import logging
 import signal

@@ -217,6 +217,10 @@ lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
 lerobot-record="lerobot.scripts.lerobot_record:main"
 lerobot-hil-record="lerobot.scripts.lerobot_hil_record:main"
+lerobot-raw-record="lerobot.scripts.lerobot_raw_record:main"
+lerobot-build-dataset="lerobot.scripts.lerobot_build_dataset:main"
+lerobot-annotate-subtask="lerobot.scripts.lerobot_annotate_subtask:main"
+lerobot-policy-deploy="lerobot.scripts.lerobot_policy_deploy:main"
 lerobot-push-dataset="lerobot.scripts.lerobot_push_dataset:main"
 lerobot-replay="lerobot.scripts.lerobot_replay:main"
 lerobot-setup-motors="lerobot.scripts.lerobot_setup_motors:main"
@@ -233,7 +237,7 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
-lerobot = ["envs/*.json"]
+lerobot = ["envs/*.json", "scripts/subtask_annotator/*.html", "scripts/subtask_annotator/*.js", "scripts/subtask_annotator/*.css"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

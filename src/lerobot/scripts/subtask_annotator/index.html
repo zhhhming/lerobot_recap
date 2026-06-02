@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Subtask 标注器</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">🏷️ Subtask 标注器</div>
+    <div class="topctrl">
+      <label>Episode
+        <select id="episodeSelect"></select>
+      </label>
+      <label>Feature 名
+        <input id="featureName" type="text" size="10" />
+      </label>
+      <span id="taskLabel" class="task-label"></span>
+    </div>
+    <div class="topright">
+      <span id="saveStatus" class="save-status"></span>
+      <button id="exportBtn" class="primary">导出 extras.parquet</button>
+    </div>
+  </header>
+
+  <div id="layout">
+    <!-- Left sidebar -->
+    <aside id="sidebar">
+      <section class="panel">
+        <h3>Subtask 列表 <span class="hint">(整个数据集共用)</span></h3>
+        <div id="subtaskList" class="subtask-list"></div>
+        <div class="add-row">
+          <input id="newSubtaskName" type="text" placeholder="新建 subtask 名称…" />
+          <button id="addSubtaskBtn">添加</button>
+        </div>
+        <div class="mode-row">
+          <span>标注模式：</span>
+          <label><input type="radio" name="mode" value="region" checked /> 区间(关键帧)</label>
+          <label><input type="radio" name="mode" value="single" /> 单帧</label>
+        </div>
+        <div class="hint mode-help" id="modeHelp"></div>
+      </section>
+
+      <section class="panel">
+        <h3>关节显示 <span class="hint">(选择要画的曲线)</span></h3>
+        <div class="quick-row">
+          <button id="pickGrippers">只看 gripper</button>
+          <button id="clearSeries">清空</button>
+        </div>
+        <div id="jointList" class="joint-list"></div>
+      </section>
+    </aside>
+
+    <!-- Main area -->
+    <main id="main">
+      <section id="cameras" class="cameras"></section>
+
+      <section class="playbar">
+        <button id="firstBtn" title="第一帧">⏮</button>
+        <button id="prevBtn" title="上一帧 (←)">◀</button>
+        <button id="playBtn" title="播放/暂停 (空格)">▶</button>
+        <button id="nextBtn" title="下一帧 (→)">▶|</button>
+        <button id="lastBtn" title="最后一帧">⏭</button>
+        <input id="frameSlider" type="range" min="0" max="0" value="0" />
+        <span id="frameLabel" class="frame-label">0 / 0</span>
+        <button id="addKfBtn" title="在当前帧加/删关键帧 (k 或 Ctrl+Enter)">⬚ 关键帧</button>
+      </section>
+
+      <section class="timeline-wrap">
+        <canvas id="board"></canvas>
+      </section>
+      <div class="hint board-help">
+        提示：单击时间轴空白处可拖动播放头；双击关键帧条添加/删除关键帧；把左侧 subtask 色块拖到某段区间即可填充该区间（含两端关键帧）。区间模式下也可先点选区间再点 subtask。
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

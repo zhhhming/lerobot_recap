@@ -36,6 +36,7 @@ import argparse
 import importlib.util
 import logging
 import os
+import shutil
 import ssl
 from pathlib import Path
 
@@ -51,6 +52,7 @@ from lerobot.utils.utils import init_logging
 
 
 logger = logging.getLogger(__name__)
+LARGE_UPLOAD_CACHE_MARKER = "lerobot_push_dataset_upload_target.txt"
 
 
 def _resolve_dataset_root(repo_id: str, root: str | Path | None) -> Path:
@@ -111,6 +113,52 @@ def _check_local_dataset(root: Path) -> None:
             f"Expected metadata file '{info_path}'. "
             "Pass --root if the dataset was recorded somewhere else."
         )
+
+
+def _large_upload_cache_dir(root: Path) -> Path:
+    return root / ".cache" / "huggingface" / "upload"
+
+
+def _large_upload_cache_marker(root: Path) -> Path:
+    return root / ".cache" / "huggingface" / LARGE_UPLOAD_CACHE_MARKER
+
+
+def _large_upload_target(repo_id: str, branch: str | None) -> str:
+    return f"dataset:{repo_id}:{branch or 'main'}"
+
+
+def _prepare_large_upload_cache(root: Path, repo_id: str, branch: str | None) -> None:
+    """Avoid reusing upload_large_folder state across different Hub repos.
+
+    huggingface_hub stores upload state under the local dataset directory and
+    documents that the same folder must not be uploaded to multiple repos unless
+    this cache is removed first. Reusing it can mark files as already committed
+    and produce an incomplete target repository.
+    """
+    upload_cache = _large_upload_cache_dir(root)
+    if not upload_cache.exists():
+        return
+
+    target = _large_upload_target(repo_id, branch)
+    marker = _large_upload_cache_marker(root)
+    previous_target = marker.read_text().strip() if marker.exists() else None
+
+    if previous_target == target:
+        return
+
+    logger.warning(
+        "Removing stale Hugging Face large-upload cache at '%s' before uploading to %s. "
+        "This prevents reusing upload state from a different dataset repo.",
+        upload_cache,
+        target,
+    )
+    shutil.rmtree(upload_cache)
+
+
+def _mark_large_upload_cache_target(root: Path, repo_id: str, branch: str | None) -> None:
+    marker = _large_upload_cache_marker(root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(_large_upload_target(repo_id, branch))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -200,6 +248,8 @@ def main() -> None:
     logger.info("Uploading dataset '%s' to the Hugging Face Hub", args.repo_id)
     if args.num_workers is not None and not args.upload_large_folder:
         logger.warning("--num-workers is ignored unless --upload-large-folder is set.")
+    if args.upload_large_folder:
+        _prepare_large_upload_cache(root, args.repo_id, args.branch)
     try:
         dataset.push_to_hub(
             branch=args.branch,
@@ -215,6 +265,8 @@ def main() -> None:
     except HfHubHTTPError:
         logger.exception("Hub upload failed. Check your Hugging Face token, repo permissions, and network/proxy.")
         raise
+    if args.upload_large_folder:
+        _mark_large_upload_cache_target(root, args.repo_id, args.branch)
 
     logger.info("Uploaded dataset to https://huggingface.co/datasets/%s", args.repo_id)
 

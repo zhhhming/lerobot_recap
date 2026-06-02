@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 JOINT_KEYS = [f"joint_{i}.pos" for i in range(1, 8)]
 GRIPPER_KEY = "gripper.pos"
 EE_KEYS = ["ee_x", "ee_y", "ee_z", "ee_roll", "ee_pitch", "ee_yaw"]
+CAMERA_STALE_FALLBACK_TIMEOUT_MS = 50
 
 
 class NeroFollower(Robot):
@@ -131,7 +132,14 @@ class NeroFollower(Robot):
         obs[GRIPPER_KEY] = float(g) if g is not None else 0.0
 
         for name, cam in self.cameras.items():
-            obs[name] = cam.async_read()
+            read_latest = getattr(cam, "read_latest", None)
+            if read_latest is None:
+                obs[name] = cam.async_read()
+                continue
+            try:
+                obs[name] = read_latest()
+            except TimeoutError:
+                obs[name] = cam.async_read(timeout_ms=CAMERA_STALE_FALLBACK_TIMEOUT_MS)
 
         return obs
 

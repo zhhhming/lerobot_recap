@@ -130,6 +130,7 @@ class HILRecordConfig:
     control_multiplier: int | None = 3
     control_hz: float | None = None
     smoother_alpha: float = 0.2
+    policy_gripper_max_width_m: float = 0.1
     display_data: bool = True
     display_ip: str | None = None
     display_port: int | None = None
@@ -148,6 +149,8 @@ class HILRecordConfig:
             raise ValueError(f"mode={self.mode!r} requires --policy.path.")
         if self.mode in ("teleop", "hil") and self.teleop is None:
             raise ValueError(f"mode={self.mode!r} requires --teleop.type.")
+        if self.inference_type == "rtc":
+            self.rtc.enabled = True
         if self.interpolation_multiplier < 1:
             raise ValueError("--interpolation_multiplier must be >= 1.")
         if self.control_multiplier is not None and self.control_multiplier < 1:
@@ -156,6 +159,8 @@ class HILRecordConfig:
             raise ValueError("--control_hz must be > 0.")
         if not 0 < self.smoother_alpha <= 1:
             raise ValueError("--smoother_alpha must be in (0, 1].")
+        if not 0 < self.policy_gripper_max_width_m <= 0.1:
+            raise ValueError("--policy_gripper_max_width_m must be in (0, 0.1].")
         if self.resume and self.dataset.force:
             raise ValueError("--dataset.force cannot be used with --resume.")
 
@@ -198,6 +203,7 @@ class _TerminalKeyboardListener:
         "\x1b": "esc",
         "q": "q",
         "e": "e",
+        "h": "h",
     }
 
     def __init__(self, events: KeyboardEvents, stdin=None) -> None:
@@ -318,7 +324,7 @@ def _init_keyboard_listener(events: KeyboardEvents):
                 events.push("space")
             elif key == keyboard.Key.esc:
                 events.push("esc")
-            elif hasattr(key, "char") and key.char in ("q", "e"):
+            elif hasattr(key, "char") and key.char in ("q", "e", "h"):
                 events.push(key.char)
 
         pynput_listener = keyboard.Listener(on_press=on_press)
@@ -346,12 +352,22 @@ def _tensor_to_action_dict(action: torch.Tensor, keys: list[str]) -> dict[str, f
     return {key: float(action[i]) for i, key in enumerate(keys)}
 
 
-def _clamp_policy_action(action: dict[str, float]) -> dict[str, float]:
+def _clamp_policy_action(action: dict[str, float], gripper_max_width_m: float) -> dict[str, float]:
     out = dict(action)
     for key, value in out.items():
         if "gripper" in key.lower():
-            out[key] = float(max(0.0, min(0.1, value)))
+            out[key] = float(max(0.0, min(gripper_max_width_m, value)))
     return out
+
+
+def _action_from_observation(obs: dict[str, Any] | None, action_keys: list[str]) -> dict[str, float] | None:
+    if obs is None:
+        return None
+    missing = [key for key in action_keys if key not in obs]
+    if missing:
+        logger.warning("Cannot build teleop handoff action from observation; missing keys: %s", missing)
+        return None
+    return {key: float(obs[key]) for key in action_keys}
 
 
 def _resolve_dataset_root(repo_id: str, root: str | Path | None) -> Path:
@@ -579,6 +595,7 @@ class PolicySource(ActionSource):
         action_keys: list[str],
         dataset_features: dict,
         robot_action_processor,
+        gripper_max_width_m: float,
     ) -> None:
         self.name: ControlSource = "autonomous"
         self._engine = engine
@@ -586,6 +603,7 @@ class PolicySource(ActionSource):
         self._action_keys = action_keys
         self._dataset_features = dataset_features
         self._robot_action_processor = robot_action_processor
+        self._gripper_max_width_m = gripper_max_width_m
         self._pending_action: torch.Tensor | None = None
         self._ready = False
         self._active = False
@@ -625,6 +643,8 @@ class PolicySource(ActionSource):
         self._ready = False
         self._pending_action = None
         self._engine.pause()
+        self._engine.reset()
+        self._interpolator.reset()
 
     def on_observation(self, obs_cache: ObsCache) -> None:
         if not self._active or not obs_cache.ready:
@@ -646,9 +666,103 @@ class PolicySource(ActionSource):
             return None
 
         action_dict = _tensor_to_action_dict(interp, self._action_keys)
-        action_dict = _clamp_policy_action(action_dict)
+        action_dict = _clamp_policy_action(action_dict, self._gripper_max_width_m)
         robot_action = self._robot_action_processor((action_dict, obs_cache.raw))
         return ActionStep(robot_action=robot_action)
+
+
+class LoopTimer:
+    """Per-segment timing collector with windowed flush.
+
+    Profiling-only helper: accumulates wall-clock samples per named segment and
+    every `window` ticks emits a summary log line with mean/p50/p95/max plus
+    the actual Hz achieved over the window and how many ticks blew the budget.
+    """
+
+    def __init__(self, window: int, control_interval_s: float) -> None:
+        self.window = max(1, int(window))
+        self._control_interval_ms = control_interval_s * 1000.0
+        self._segments: dict[str, list[float]] = {}
+        self._ticks = 0
+
+    def record(self, name: str, seconds: float) -> None:
+        bucket = self._segments.get(name)
+        if bucket is None:
+            bucket = []
+            self._segments[name] = bucket
+        bucket.append(seconds * 1000.0)
+
+    def block(self, name: str) -> "_TimedBlock":
+        return _TimedBlock(self, name)
+
+    def tick(self) -> None:
+        self._ticks += 1
+        if self._ticks >= self.window:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._segments or self._ticks == 0:
+            self._segments.clear()
+            self._ticks = 0
+            return
+
+        loop_total = self._segments.get("loop_total", [])
+        window_s = sum(loop_total) / 1000.0 if loop_total else 0.0
+        actual_hz = self._ticks / window_s if window_s > 0 else 0.0
+
+        loop_compute = self._segments.get("loop_compute", [])
+        over = sum(1 for v in loop_compute if v > self._control_interval_ms)
+        over_str = (
+            f", over-budget {over}/{len(loop_compute)} ({100 * over / len(loop_compute):.0f}%)"
+            if loop_compute
+            else ""
+        )
+
+        lines = [
+            f"=== loop timing: {self._ticks} ticks in {window_s:.2f}s "
+            f"({actual_hz:.1f} Hz, target {1000.0 / self._control_interval_ms:.1f} Hz){over_str} ==="
+        ]
+        for name in sorted(self._segments):
+            vals = self._segments[name]
+            if not vals:
+                continue
+            sv = sorted(vals)
+            n = len(sv)
+            mean = sum(sv) / n
+            p50 = sv[n // 2]
+            p95 = sv[min(n - 1, int(n * 0.95))]
+            mx = sv[-1]
+            lines.append(
+                f"  {name:18s} n={n:4d} mean={mean:6.2f} p50={p50:6.2f} "
+                f"p95={p95:6.2f} max={mx:6.2f}  (ms)"
+            )
+        logger.info("\n".join(lines))
+        self._segments.clear()
+        self._ticks = 0
+
+
+class _TimedBlock:
+    __slots__ = ("_timer", "_name", "_t0")
+
+    def __init__(self, timer: LoopTimer, name: str) -> None:
+        self._timer = timer
+        self._name = name
+        self._t0 = 0.0
+
+    def __enter__(self) -> "_TimedBlock":
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._timer.record(self._name, time.perf_counter() - self._t0)
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
 
 
 class EpisodeRecorder:
@@ -659,26 +773,36 @@ class EpisodeRecorder:
         task: str,
         display_data: bool,
         display_compressed_images: bool,
+        timer: LoopTimer | None = None,
     ) -> None:
         self._dataset = dataset
         self._dataset_features = dataset_features
         self._task = task
         self._display_data = display_data
         self._display_compressed_images = display_compressed_images
+        self._timer = timer
         self.frames = 0
 
+    def _time(self, name: str):
+        if self._timer is None:
+            return _NullContext()
+        return self._timer.block(name)
+
     def add(self, obs_processed: dict[str, Any], robot_action: dict[str, float]) -> None:
-        obs_frame = build_dataset_frame(self._dataset_features, obs_processed, prefix=OBS_STR)
-        action_frame = build_dataset_frame(self._dataset_features, robot_action, prefix=ACTION)
-        self._dataset.add_frame({**obs_frame, **action_frame, "task": self._task})
+        with self._time("rec_build_frame"):
+            obs_frame = build_dataset_frame(self._dataset_features, obs_processed, prefix=OBS_STR)
+            action_frame = build_dataset_frame(self._dataset_features, robot_action, prefix=ACTION)
+        with self._time("rec_add_frame"):
+            self._dataset.add_frame({**obs_frame, **action_frame, "task": self._task})
         self.frames += 1
 
         if self._display_data:
-            log_rerun_data(
-                observation=obs_processed,
-                action=robot_action,
-                compress_images=self._display_compressed_images,
-            )
+            with self._time("rec_rerun"):
+                log_rerun_data(
+                    observation=obs_processed,
+                    action=robot_action,
+                    compress_images=self._display_compressed_images,
+                )
 
     def save(self) -> None:
         self._dataset.save_episode()
@@ -867,7 +991,11 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                 action_keys=action_keys,
                 dataset_features=dataset_features,
                 robot_action_processor=robot_action_processor,
+                gripper_max_width_m=cfg.policy_gripper_max_width_m,
             )
+
+        control_interval = 1.0 / control_hz
+        loop_timer = LoopTimer(window=int(control_hz), control_interval_s=control_interval)
 
         recorder = EpisodeRecorder(
             dataset=dataset,
@@ -875,6 +1003,7 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
             task=cfg.dataset.single_task,
             display_data=cfg.display_data,
             display_compressed_images=display_compressed_images,
+            timer=loop_timer,
         )
         smoother = ActionSmoother(
             alpha=cfg.smoother_alpha,
@@ -896,6 +1025,18 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                 sources[target].on_deactivate()
             sm.source = None
             sm.prepare_target = None
+
+        def teleop_handoff_action(target: ControlSource) -> dict[str, float] | None:
+            if target not in ("teleop", "correction"):
+                return None
+            if last_action_to_send is not None:
+                return dict(last_action_to_send)
+            with loop_timer.block("handoff_obs_read"):
+                obs = robot_wrapper.get_observation()
+            with loop_timer.block("handoff_obs_proc"):
+                obs_cache.raw = obs
+                obs_cache.processed = robot_observation_processor(obs)
+            return _action_from_observation(obs_cache.raw, action_keys)
 
         def prepare_source(target: ControlSource) -> None:
             nonlocal prepare_ready_announced
@@ -922,11 +1063,7 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                 sources[sm.source].on_deactivate()
             if sm.prepare_target is not None and sm.prepare_target != target:
                 sources[sm.prepare_target].on_deactivate()
-            handoff_action = (
-                dict(last_action_to_send)
-                if target in ("teleop", "correction") and last_action_to_send is not None
-                else None
-            )
+            handoff_action = teleop_handoff_action(target)
             sources[target].on_activate(handoff_action)
             smoother.reset()
             sm.source = target
@@ -1008,7 +1145,6 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
 
         with VideoEncodingManager(dataset):
             loop_i = 0
-            control_interval = 1.0 / control_hz
             while not sm.stop_requested:
                 loop_start = time.perf_counter()
 
@@ -1017,22 +1153,26 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                     log_say("Inference engine failed; stopping HIL recording", cfg.play_sounds)
                     break
 
-                event = events.pop_latest()
-                if event is not None:
-                    sm.handle(event, sm_actions)
-                    if sm.stop_requested:
-                        break
+                with loop_timer.block("event_handle"):
+                    event = events.pop_latest()
+                    if event is not None:
+                        sm.handle(event, sm_actions)
+                if sm.stop_requested:
+                    break
 
                 is_obs_tick = loop_i % obs_stride == 0
                 if is_obs_tick:
-                    obs = robot_wrapper.get_observation()
-                    obs_cache.raw = obs
-                    obs_cache.processed = robot_observation_processor(obs)
+                    with loop_timer.block("obs_read"):
+                        obs = robot_wrapper.get_observation()
+                    with loop_timer.block("obs_proc"):
+                        obs_cache.raw = obs
+                        obs_cache.processed = robot_observation_processor(obs)
 
                 if is_obs_tick and sm.state == "preparing" and sm.prepare_target is not None:
                     source = sources[sm.prepare_target]
                     was_ready = source.ready
-                    source.update_prepare(obs_cache)
+                    with loop_timer.block("prepare_update"):
+                        source.update_prepare(obs_cache)
                     if (
                         sm.prepare_target == "autonomous"
                         and source.ready
@@ -1046,17 +1186,23 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                 action_to_record = None
                 if sm.state == "recording" and sm.source is not None:
                     if is_obs_tick:
-                        sources[sm.source].on_observation(obs_cache)
-                    action_step = sources[sm.source].step(obs_cache)
+                        with loop_timer.block("source_on_obs"):
+                            sources[sm.source].on_observation(obs_cache)
+                    with loop_timer.block("source_step"):
+                        action_step = sources[sm.source].step(obs_cache)
                     if action_step is not None:
-                        action_to_send = smoother.step(action_step.robot_action)
+                        with loop_timer.block("smoother"):
+                            action_to_send = smoother.step(action_step.robot_action)
                         action_to_record = action_to_send
-                        robot_wrapper.send_action(action_to_send)
+                        with loop_timer.block("send_action"):
+                            robot_wrapper.send_action(action_to_send)
                         last_action_to_send = action_to_send
                     elif last_action_to_send is not None:
-                        robot_wrapper.send_action(last_action_to_send)
+                        with loop_timer.block("send_action"):
+                            robot_wrapper.send_action(last_action_to_send)
                 elif sm.state == "paused" and last_action_to_send is not None:
-                    robot_wrapper.send_action(last_action_to_send)
+                    with loop_timer.block("send_action"):
+                        robot_wrapper.send_action(last_action_to_send)
 
                 if (
                     is_obs_tick
@@ -1067,6 +1213,7 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                     recorder.add(obs_cache.processed, action_to_record)
 
                 dt = time.perf_counter() - loop_start
+                loop_timer.record("loop_compute", dt)
                 if (sleep_t := control_interval - dt) > 0:
                     precise_sleep(sleep_t)
                 elif sm.state == "recording":
@@ -1075,6 +1222,9 @@ def hil_record(cfg: HILRecordConfig) -> LeRobotDataset:
                         1 / max(dt, 1e-6),
                         1 / control_interval,
                     )
+                loop_timer.record("loop_total", time.perf_counter() - loop_start)
+                if sm.state == "recording":
+                    loop_timer.tick()
                 loop_i += 1
     finally:
         log_say("Stopping HIL recording", cfg.play_sounds, blocking=True)

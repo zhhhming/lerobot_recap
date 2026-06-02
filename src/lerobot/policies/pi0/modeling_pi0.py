@@ -674,8 +674,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-            # Also compile the main forward pass used during training
+            # Compile the per-step denoiser only: its inputs (state, prefix_pad_masks,
+            # past_key_values, x_t, timestep) all have stable shapes across diffusion
+            # steps and across inferences, so dynamo can compile it once and reuse.
+            # Compiling the outer sample_actions instead triggers recompiles whenever
+            # RTC inputs (e.g. prev_chunk_left_over.shape, inference_delay) vary.
+            self.denoise_step = torch.compile(self.denoise_step, mode=config.compile_mode)
+            # Training forward has stable shapes and benefits from compilation.
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def gradient_checkpointing_enable(self):
@@ -941,7 +946,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_scalar_tensor = torch.tensor(time, dtype=torch.float32, device=device)
+            time_tensor = time_scalar_tensor.expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -961,7 +967,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
-                    time=time,
+                    time=time_scalar_tensor,
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
                 )
