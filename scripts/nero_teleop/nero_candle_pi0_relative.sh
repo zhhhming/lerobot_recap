@@ -41,6 +41,13 @@ POLICY_DTYPE="${POLICY_DTYPE:-float32}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
+PREDICT_SUBTASK="${PREDICT_SUBTASK:-false}"
+SUBTASK_MAX_TOKENS="${SUBTASK_MAX_TOKENS:-48}"
+SUBTASK_CE_LOSS_WEIGHT="${SUBTASK_CE_LOSS_WEIGHT:-0.25}"
+SUBTASK_DROPOUT_PROB="${SUBTASK_DROPOUT_PROB:-0.2}"
+SUBTASK_GENERATE_AT_INFERENCE="${SUBTASK_GENERATE_AT_INFERENCE:-true}"
+SUBTASK_MAX_DECODE_TOKENS="${SUBTASK_MAX_DECODE_TOKENS:-48}"
+SUBTASK_DECODE_TEMPERATURE="${SUBTASK_DECODE_TEMPERATURE:-0.0}"
 
 usage() {
     cat <<EOF
@@ -64,7 +71,10 @@ Environment overrides:
   CHUNK_SIZE, RELATIVE_EXCLUDE_JOINTS, NUM_WORKERS, HF_SNAPSHOT_MAX_WORKERS, DISABLE_PROXY,
   POLICY_PRETRAINED_PATH, NUM_GPUS, GLOBAL_BATCH_SIZE, PER_DEVICE_BATCH_SIZE,
   STEPS, SAVE_FREQ, LOG_FREQ, RUN_ID, JOB_NAME, OUTPUT_DIR, POLICY_COMPILE,
-  POLICY_DTYPE, MIXED_PRECISION, GRADIENT_CHECKPOINTING, WANDB_ENABLE
+  POLICY_DTYPE, MIXED_PRECISION, GRADIENT_CHECKPOINTING, WANDB_ENABLE,
+  PREDICT_SUBTASK, SUBTASK_MAX_TOKENS, SUBTASK_CE_LOSS_WEIGHT,
+  SUBTASK_DROPOUT_PROB, SUBTASK_GENERATE_AT_INFERENCE,
+  SUBTASK_MAX_DECODE_TOKENS, SUBTASK_DECODE_TEMPERATURE
 EOF
 }
 
@@ -99,6 +109,13 @@ POLICY_DTYPE=${POLICY_DTYPE}
 MIXED_PRECISION=${MIXED_PRECISION}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}
 WANDB_ENABLE=${WANDB_ENABLE}
+PREDICT_SUBTASK=${PREDICT_SUBTASK}
+SUBTASK_MAX_TOKENS=${SUBTASK_MAX_TOKENS}
+SUBTASK_CE_LOSS_WEIGHT=${SUBTASK_CE_LOSS_WEIGHT}
+SUBTASK_DROPOUT_PROB=${SUBTASK_DROPOUT_PROB}
+SUBTASK_GENERATE_AT_INFERENCE=${SUBTASK_GENERATE_AT_INFERENCE}
+SUBTASK_MAX_DECODE_TOKENS=${SUBTASK_MAX_DECODE_TOKENS}
+SUBTASK_DECODE_TEMPERATURE=${SUBTASK_DECODE_TEMPERATURE}
 EOF
 }
 
@@ -187,6 +204,13 @@ accelerate launch \\
   --policy.dtype=${POLICY_DTYPE} \\
   --policy.freeze_vision_encoder=false \\
   --policy.train_expert_only=false \\
+  --policy.predict_subtask=${PREDICT_SUBTASK} \\
+  --policy.subtask_max_tokens=${SUBTASK_MAX_TOKENS} \\
+  --policy.subtask_ce_loss_weight=${SUBTASK_CE_LOSS_WEIGHT} \\
+  --policy.subtask_dropout_prob=${SUBTASK_DROPOUT_PROB} \\
+  --policy.subtask_generate_at_inference=${SUBTASK_GENERATE_AT_INFERENCE} \\
+  --policy.subtask_max_decode_tokens=${SUBTASK_MAX_DECODE_TOKENS} \\
+  --policy.subtask_decode_temperature=${SUBTASK_DECODE_TEMPERATURE} \\
   --policy.push_to_hub=false \\
   --policy.device=cuda \\
   --batch_size=${per_device_bs} \\
@@ -223,6 +247,13 @@ train_pi0() {
         --policy.dtype="${POLICY_DTYPE}" \
         --policy.freeze_vision_encoder=false \
         --policy.train_expert_only=false \
+        --policy.predict_subtask="${PREDICT_SUBTASK}" \
+        --policy.subtask_max_tokens="${SUBTASK_MAX_TOKENS}" \
+        --policy.subtask_ce_loss_weight="${SUBTASK_CE_LOSS_WEIGHT}" \
+        --policy.subtask_dropout_prob="${SUBTASK_DROPOUT_PROB}" \
+        --policy.subtask_generate_at_inference="${SUBTASK_GENERATE_AT_INFERENCE}" \
+        --policy.subtask_max_decode_tokens="${SUBTASK_MAX_DECODE_TOKENS}" \
+        --policy.subtask_decode_temperature="${SUBTASK_DECODE_TEMPERATURE}" \
         --policy.push_to_hub=false \
         --policy.device=cuda \
         --batch_size="${per_device_bs}" \

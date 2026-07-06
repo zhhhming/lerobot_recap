@@ -82,6 +82,7 @@ from .relative_action_processor import (
     to_relative_actions,
 )
 from .rename_processor import RenameObservationsProcessorStep
+from .subtask_processor import SubtaskTextProcessorStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
@@ -130,6 +131,7 @@ __all__ = [
     "AddBatchDimensionProcessorStep",
     "RobotProcessorPipeline",
     "TokenizerProcessorStep",
+    "SubtaskTextProcessorStep",
     "ActionTokenizerProcessorStep",
     "Torch2NumpyActionProcessorStep",
     "RobotActionToPolicyActionProcessorStep",

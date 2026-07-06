@@ -34,6 +34,7 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
+    SubtaskTextProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
@@ -55,6 +56,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    omit_action_suffix: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -65,6 +67,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        if isinstance(tasks, str):
+            tasks = [tasks]
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -78,7 +82,10 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         for i, task in enumerate(tasks):
             cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
             state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if self.omit_action_suffix:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\n"
+            else:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
@@ -93,6 +100,13 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         This step does not alter the feature definitions.
         """
         return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "max_state_dim": self.max_state_dim,
+            "task_key": self.task_key,
+            "omit_action_suffix": self.omit_action_suffix,
+        }
 
 
 def make_pi05_pre_post_processors(
@@ -145,15 +159,26 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
-            max_length=config.tokenizer_max_length,
-            padding_side="right",
-            padding="max_length",
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            omit_action_suffix=config.predict_subtask,
         ),
-        DeviceProcessorStep(device=config.device),
     ]
+    if config.predict_subtask:
+        input_steps.append(SubtaskTextProcessorStep())
+    input_steps.extend(
+        [
+            TokenizerProcessorStep(
+                tokenizer_name="google/paligemma-3b-pt-224",
+                max_length=config.tokenizer_max_length,
+                padding_side="right",
+                padding="max_length",
+                tokenize_subtask=config.predict_subtask,
+                subtask_max_length=config.subtask_max_tokens,
+            ),
+            DeviceProcessorStep(device=config.device),
+        ]
+    )
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(

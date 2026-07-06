@@ -32,6 +32,7 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
+    SubtaskTextProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
@@ -139,20 +140,28 @@ def make_pi0_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
         Pi0NewLineProcessor(),  # Add newlines before tokenization for PaliGemma
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
-            max_length=config.tokenizer_max_length,
-            padding_side="right",
-            padding="max_length",
-        ),
-        DeviceProcessorStep(device=config.device),
-        relative_step,
-        NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
     ]
+    if config.predict_subtask:
+        input_steps.append(SubtaskTextProcessorStep())
+    input_steps.extend(
+        [
+            TokenizerProcessorStep(
+                tokenizer_name="google/paligemma-3b-pt-224",
+                max_length=config.tokenizer_max_length,
+                padding_side="right",
+                padding="max_length",
+                tokenize_subtask=config.predict_subtask,
+                subtask_max_length=config.subtask_max_tokens,
+            ),
+            DeviceProcessorStep(device=config.device),
+            relative_step,
+            NormalizerProcessorStep(
+                features={**config.input_features, **config.output_features},
+                norm_map=config.normalization_mapping,
+                stats=dataset_stats,
+            ),
+        ]
+    )
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(

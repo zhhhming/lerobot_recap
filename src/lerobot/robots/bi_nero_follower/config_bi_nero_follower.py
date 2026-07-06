@@ -43,12 +43,14 @@ class BiNeroFollowerConfig(RobotConfig):
     left_arm_config: NeroFollowerConfigBase = field(
         default_factory=lambda: NeroFollowerConfigBase(
             can_channel="left",
+            gripper_force_n=1.0,
             cameras=nero_left_cameras_config(),
         )
     )
     right_arm_config: NeroFollowerConfigBase = field(
         default_factory=lambda: NeroFollowerConfigBase(
             can_channel="right",
+            gripper_force_n=1.0,#划火柴:1.0,炒鸡蛋:0.5
             cameras=nero_right_cameras_config(),
         )
     )

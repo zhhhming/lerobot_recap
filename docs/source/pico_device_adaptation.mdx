@@ -1,0 +1,468 @@
+# Pico 遥操作设备适配指南
+
+这份指南用于说明：如果对方要基于当前改动过的 LeRobot 代码采集数据，但使用自己的机械臂和相机，应该如何完成设备适配。
+
+当前参考实现主要在这些目录：
+
+- 机械臂本体：`src/lerobot/robots/bi_nero_follower`
+- Pico 遥操作：`src/lerobot/teleoperators/bi_pico_nero_teleop`
+- Orbbec 相机：`src/lerobot/cameras/orbbec`
+- 采集脚本：`src/lerobot/scripts/lerobot_hil_record.py` 和 `src/lerobot/scripts/lerobot_raw_record.py`
+
+通常的适配范围是：
+
+- Pico 遥操作方案继续使用。
+- 机械臂连接、状态读取、动作下发需要替换成新机械臂的实现。
+- 相机连接、取流、序列号配置需要替换成新相机的实现。
+- 新机械臂需要提供自己的 URDF、关节名、末端 link、home 位置、限位和安全参数。
+- 新 SDK 需要先确认不会和当前 Python 环境、原有相机 SDK、原有机器人 SDK 产生冲突。
+
+## 1. 先理解采集脚本的接口关系
+
+`lerobot_hil_record.py` 和 `lerobot_raw_record.py` 本身基本不关心硬件型号。它们的关键流程是：
+
+1. 根据 `--robot.type` 创建 `robot = make_robot_from_config(cfg.robot)`。
+2. 根据 `--teleop.type` 创建 `teleop = make_teleoperator_from_config(cfg.teleop)`。
+3. 在连接硬件之前，根据 `robot.action_features` 和 `robot.observation_features` 创建 dataset feature schema。
+4. 调用 `robot.connect()`。
+5. 如果 teleop 有 `attach` 方法，调用 `teleop.attach(robot)`。
+6. 调用 `teleop.connect()`。
+7. 采集循环里读取 `robot.get_observation()`，读取 `teleop.get_action()`，调用 `robot.send_action(action)`，然后记录数据。
+
+所以新设备适配的核心不是改采集脚本，而是实现稳定的三类接口：
+
+- `Robot`：负责机械臂和相机，提供 observation 和 action。
+- `Teleoperator`：负责 Pico 输入到机械臂 action 的转换。
+- `Camera`：负责相机枚举、连接、取帧、断开。
+
+最重要的约束是：`teleop.get_action()` 返回的 action key 必须和 `robot.action_features` 完全一致，否则动作不会正确下发，也会影响数据集和策略兼容性。
+
+当前单臂 Nero 的 action schema 是：
+
+```text
+joint_1.pos
+joint_2.pos
+joint_3.pos
+joint_4.pos
+joint_5.pos
+joint_6.pos
+joint_7.pos
+gripper.pos
+```
+
+当前双臂 wrapper 会给机械臂 action 和 proprioception observation 加前缀：
+
+```text
+left_joint_1.pos ... left_joint_7.pos
+left_gripper.pos
+right_joint_1.pos ... right_joint_7.pos
+right_gripper.pos
+```
+
+相机 key 不会被双臂 wrapper 自动加前缀。需要在配置里直接给唯一名字，例如 `left_wrist`、`right_wrist`、`third_person`。
+
+## 2. 先隔离 Python 环境
+
+在写适配代码之前，先确认新机械臂 SDK 和新相机 SDK 能在当前 LeRobot 环境里稳定导入。
+
+推荐流程：
+
+1. 为新设备单独创建 venv 或 conda 环境。
+2. 在这个环境里安装当前 LeRobot repo 的 editable 版本。
+3. 安装新机械臂 SDK 和新相机 SDK。
+4. 先做 import-only 检查，不急着连接真实硬件。
+5. 检查 native library 冲突，例如 `LD_LIBRARY_PATH`、ROS 注入的 SDK、CUDA 运行库、厂商 `.so` 文件。
+
+示例：
+
+```bash
+python -c "import lerobot; print('lerobot ok')"
+python -c "import your_robot_sdk; print('robot sdk ok')"
+python -c "import your_camera_sdk; print('camera sdk ok')"
+python -c "from lerobot.cameras.orbbec.camera_orbbec import OrbbecCamera; print('existing orbbec ok')"
+```
+
+如果新 SDK 依赖环境变量，把这些变量写进明确的启动脚本或 README，不要依赖临时 shell 历史。不要直接修改系统 Python 包。
+
+## 3. 实现单臂 Robot 适配层
+
+建议新建类似下面的目录：
+
+```text
+src/lerobot/robots/my_arm_follower/
+  __init__.py
+  config_my_arm_follower.py
+  my_arm_follower.py
+  my_arm_driver.py
+```
+
+`config_my_arm_follower.py` 里放所有需要按机器、任务或硬件变化的参数：
+
+- 连接参数：串口、CAN channel、IP、baud rate、固件版本。
+- 控制参数：控制模式、控制频率、速度限制、力矩限制、关节限位。
+- 安全参数：断开连接时是否下使能、连接超时、动作 clamp。
+- Home 位置：`home_joints_rad`。
+- 运动学资产：URDF 路径、`joint_names`、`ee_link`。
+- 绑定到 robot 的相机配置。
+
+Robot 类需要继承 `Robot` 并实现 LeRobot 的标准接口：
+
+```python
+from functools import cached_property
+
+from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.robots import Robot
+from lerobot.types import RobotAction, RobotObservation
+
+JOINT_KEYS = [f"joint_{i}.pos" for i in range(1, 8)]
+GRIPPER_KEY = "gripper.pos"
+
+
+class MyArmFollower(Robot):
+    config_class = MyArmFollowerConfig
+    name = "my_arm_follower"
+
+    def __init__(self, config: MyArmFollowerConfig):
+        super().__init__(config)
+        self.config = config
+        self.driver = MyArmDriver(config)
+        self.cameras = make_cameras_from_configs(config.cameras)
+
+    @cached_property
+    def observation_features(self) -> dict:
+        return {
+            **{key: float for key in JOINT_KEYS},
+            GRIPPER_KEY: float,
+            **{name: (cam.height, cam.width, 3) for name, cam in self.cameras.items()},
+        }
+
+    @cached_property
+    def action_features(self) -> dict:
+        return {**{key: float for key in JOINT_KEYS}, GRIPPER_KEY: float}
+
+    @property
+    def is_connected(self) -> bool:
+        return self.driver.is_connected and all(cam.is_connected for cam in self.cameras.values())
+
+    def connect(self, calibrate: bool = True) -> None:
+        self.driver.connect()
+        for cam in self.cameras.values():
+            cam.connect()
+
+    @property
+    def is_calibrated(self) -> bool:
+        return True
+
+    def calibrate(self) -> None:
+        return
+
+    def configure(self) -> None:
+        return
+
+    def get_observation(self) -> RobotObservation:
+        q = self.driver.get_joint_angles_rad()
+        g = self.driver.get_gripper_width_m()
+        obs = {key: float(q[i]) for i, key in enumerate(JOINT_KEYS)}
+        obs[GRIPPER_KEY] = float(g)
+        for name, cam in self.cameras.items():
+            read_latest = getattr(cam, "read_latest", None)
+            obs[name] = read_latest() if callable(read_latest) else cam.async_read()
+        return obs
+
+    def send_action(self, action: RobotAction) -> RobotAction:
+        q = [float(action[key]) for key in JOINT_KEYS]
+        g = float(action[GRIPPER_KEY])
+        q_safe, g_safe = self.driver.clip_command(q, g)
+        self.driver.send_joint_positions_rad(q_safe, gripper_width_m=g_safe)
+        return {**{JOINT_KEYS[i]: q_safe[i] for i in range(len(JOINT_KEYS))}, GRIPPER_KEY: g_safe}
+
+    def disconnect(self) -> None:
+        for cam in self.cameras.values():
+            cam.disconnect()
+        self.driver.disconnect()
+```
+
+实现时要注意：
+
+- `observation_features` 和 `action_features` 必须在未连接硬件时也能返回稳定结构，因为采集脚本会先创建 dataset schema，再连接设备。
+- `get_observation()` 返回的 key 必须和 `observation_features` 一致。
+- `send_action()` 接收的 key 必须和 `action_features` 一致。
+- `send_action()` 应该做安全裁剪，并返回实际下发给硬件的动作。
+- 旋转关节统一用弧度，夹爪开口统一用米，除非同步修改 teleop、policy 和 processor。
+- `send_action()` 不应该长时间阻塞。如果 SDK 需要固定频率控制，可以像 Nero 一样做后台控制线程。
+
+## 4. 实现双臂 Robot wrapper
+
+如果是双臂采集，需要再实现一个双臂 wrapper，结构可以参考 `BiNeroFollower`。
+
+双臂 wrapper 需要做这些事：
+
+- 拥有 `left_arm` 和 `right_arm` 两个单臂对象。
+- 给左右臂的关节和夹爪 key 加 `left_` 和 `right_` 前缀。
+- 在 `send_action()` 里按前缀拆分左右臂 action。
+- 在 `get_observation()` 里合并左右臂 observation。
+- 保持相机 key 唯一，通常相机 key 不再额外自动加前缀。
+- 给 teleop 暴露左右臂对象，例如 `left_arm`、`right_arm` 或 `get_arm("left")`、`get_arm("right")`。
+
+左右臂不同的连接参数应该放在 wrapper config 里，例如不同串口、CAN channel、IP、相机序列号、home 位置。
+
+## 5. 适配 Pico Teleop
+
+当前 `BiPicoNeroTeleop` 不是通用的 Pico-to-any-arm teleop。它内部创建了两个 `PicoNeroTeleop`，而 `PicoNeroTeleop` 默认假设：
+
+- 传入的 robot arm 是 Nero 风格对象。
+- arm 上有 Nero driver，例如 `driver.get_joint_angles()` 和 `driver.get_gripper_width()`。
+- action key 是 Nero 的 `joint_1.pos` 到 `joint_7.pos`，再加 `gripper.pos`。
+- IK 使用 Nero 的 URDF、Nero 的 joint names 和 Nero 的 end-effector link。
+
+所以如果新机械臂不是 Nero，不建议直接复用 `BiPicoNeroTeleop`。更稳妥的方式是新建自己的 Pico teleop 包：
+
+```text
+src/lerobot/teleoperators/bi_pico_my_arm_teleop/
+  __init__.py
+  config_bi_pico_my_arm_teleop.py
+  bi_pico_my_arm_teleop.py
+
+src/lerobot/teleoperators/pico_my_arm_teleop/
+  __init__.py
+  config_pico_my_arm_teleop.py
+  pico_my_arm_teleop.py
+  placo_my_arm_kinematics.py
+```
+
+可以复用 Nero 版本里的 Pico 输入处理、状态机、pose mapper 和 `XrClient`，但需要替换机械臂相关部分：
+
+- `JOINT_KEYS`
+- `GRIPPER_KEY`
+- `GRIPPER_MAX_WIDTH_M`
+- URDF 路径
+- `joint_names`
+- `ee_link`
+- home 位置
+- IK solver 初始化
+- `connect()` 里读取当前关节和夹爪状态的方式
+- action clamp、关节速度限制和夹爪方向
+
+双臂 Pico teleop 应该实现：
+
+- `attach(robot)`：创建一个共享 `XrClient`，左 teleop attach 到 `robot.left_arm`，右 teleop attach 到 `robot.right_arm`。
+- `action_features`：返回带 `left_` 和 `right_` 前缀的 action key，并且必须和双臂 robot 的 `action_features` 一致。
+- `connect()`：要求必须先调用 `attach(robot)`。
+- `get_action()`：返回一个 flat dict，里面是左右臂带前缀的 action。
+- `prime_action(action, lock_reference=True)`：建议实现，用于 HIL 从 policy 切到人工 correction 时保持连续。
+- `release_primed_action()`：建议实现，用于 correction 结束后释放参考帧。
+- `disconnect()`：先停止左右 teleop 线程，再关闭共享 XR client。
+
+`prime_action()` 很重要。HIL 模式下，从 policy 切到人工接管时，采集脚本会尝试调用它，让第一帧人工 correction 从上一帧机器人动作继续，而不是从旧 teleop 缓存或当前测量值突然跳变。
+
+## 6. 适配相机
+
+如果新相机已经被 LeRobot 支持，优先使用已有 config：
+
+- OpenCV：`OpenCVCameraConfig`
+- RealSense：`RealSenseCameraConfig`
+- Orbbec：`OrbbecCameraConfig`
+- ZMQ：`ZMQCameraConfig`
+
+如果必须使用新 SDK，建议新建：
+
+```text
+src/lerobot/cameras/my_camera/
+  __init__.py
+  configuration_my_camera.py
+  camera_my_camera.py
+```
+
+相机 config 需要继承 `CameraConfig` 并注册唯一 type：
+
+```python
+from dataclasses import dataclass
+
+from lerobot.cameras.configs import CameraConfig, ColorMode, Cv2Rotation
+
+
+@CameraConfig.register_subclass("my_camera")
+@dataclass
+class MyCameraConfig(CameraConfig):
+    serial_number_or_name: str | None = None
+    color_mode: ColorMode = ColorMode.RGB
+    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
+```
+
+相机类需要继承 `Camera` 并实现：
+
+- `find_cameras()`
+- `connect(warmup=True)`
+- `read()`
+- `async_read(timeout_ms=...)`
+- `read_latest(max_age_ms=...)`
+- `disconnect()`
+- `is_connected`
+
+图像返回值应该是 shape 为 `(height, width, 3)` 的 `numpy.ndarray`。这个 shape 必须和 config 里的 `width`、`height` 一致，因为 robot feature schema 会在连接硬件之前创建。
+
+采集时推荐实现非阻塞的 `read_latest()`。如果最新帧太旧，应该抛出 `TimeoutError`。当前 Nero robot 会优先使用 `read_latest()`，这样慢相机不容易卡住控制循环。
+
+## 7. 注册新类型
+
+如果新适配直接放在当前 repo 内，需要更新 factory：
+
+- `src/lerobot/robots/utils.py`：在 `make_robot_from_config` 里添加新 robot type。
+- `src/lerobot/teleoperators/utils.py`：在 `make_teleoperator_from_config` 里添加新 teleop type。
+- `src/lerobot/cameras/utils.py`：在 `make_cameras_from_configs` 里添加新 camera type。
+
+还需要在两个采集脚本里 import 新 config 模块，让 CLI parser 能解析 `--robot.type`、`--teleop.type` 和 camera config：
+
+- `src/lerobot/scripts/lerobot_hil_record.py`
+- `src/lerobot/scripts/lerobot_raw_record.py`
+
+示例：
+
+```python
+from lerobot.robots import my_arm_follower  # noqa: F401,E402
+from lerobot.teleoperators import bi_pico_my_arm_teleop  # noqa: F401,E402
+from lerobot.cameras.my_camera.configuration_my_camera import MyCameraConfig  # noqa: F401
+```
+
+如果适配代码放在 repo 外部，可以使用 LeRobot 的第三方 plugin 机制，但依然要保证 config class 在 CLI 参数解析之前已经注册。
+
+## 8. 准备 URDF、home 位置和限位
+
+建议把机械臂资产放在清晰路径下，例如：
+
+```text
+src/lerobot/assets/my_arm/urdf/my_arm_with_gripper.urdf
+```
+
+在遥操作前必须确认：
+
+- URDF 的关节顺序和 `joint_names` 完全一致。
+- `ee_link` 是真实要控制的 TCP，或者是有意定义的虚拟 TCP。
+- 关节单位是弧度。
+- mesh 路径能从 URDF 所在位置正确解析。
+- URDF 里的 joint limit 和真实硬件安全范围一致，不能只相信 CAD 默认值。
+- home 位置可达、无碰撞，并且远离桌面、相机和操作人员。
+- 左右臂镜像安装时，左右 home 位置分别正确。
+
+同一个 home 位置需要在这些地方保持一致：
+
+- Robot config：用于 robot 侧 fallback 和 homing。
+- Teleop config：用于 Pico home button。
+- 采集脚本参数：如果 raw recording 使用 `--home_joints_rad`，也要同步。
+
+初期调试时使用保守的速度、夹爪力和每帧最大动作步长。确认关节顺序、正负方向、夹爪开合方向都正确后，再逐步提高。
+
+## 9. 最小联调流程
+
+按下面顺序调，不要一开始就进入完整数据采集。
+
+### 9.1 import 和 config 检查
+
+```bash
+python -c "from lerobot.robots.my_arm_follower import MyArmFollowerConfig; print(MyArmFollowerConfig())"
+python -c "from lerobot.teleoperators.bi_pico_my_arm_teleop import BiPicoMyArmTeleopConfig; print(BiPicoMyArmTeleopConfig())"
+```
+
+### 9.2 相机检查
+
+用 `MyCamera.find_cameras()` 或厂商 SDK 先确认：
+
+- 能找到所有相机。
+- serial number 或设备名稳定。
+- 分辨率、FPS、颜色顺序正确。
+- USB 带宽足够，多相机同时开流不会掉帧。
+
+### 9.3 Robot 单独连接
+
+写一个临时 smoke test：
+
+1. 创建 robot config。
+2. 调用 `robot.connect()`。
+3. 连续调用几次 `robot.get_observation()`。
+4. 把当前关节位置原样发回 `robot.send_action()`，确认 hold 住不动。
+5. 调用 `robot.disconnect()`。
+
+这一步稳定之前，不要接 Pico teleop。
+
+### 9.4 Teleop 连接但暂不运动
+
+连接 Pico teleop，验证 `get_action()` 会随手柄变化，但先在 driver 里禁用真实动作下发，或设置极小动作 clamp。确认：
+
+- 左手柄只影响左臂 action key。
+- 右手柄只影响右臂 action key。
+- trigger 的方向和夹爪开合一致。
+- home button 对应正确手柄。
+- grip 激活瞬间不会产生大跳变。
+
+### 9.5 低速运动
+
+先低速、单臂、小步长测试，然后再开双臂。每次只改一个变量，避免同时调 URDF、坐标系、夹爪和速度。
+
+## 10. 数据采集命令
+
+Teleop-only 采集到 LeRobotDataset：
+
+```bash
+python -m lerobot.scripts.lerobot_hil_record \
+  --robot.type=bi_my_arm_follower \
+  --teleop.type=bi_pico_my_arm_teleop \
+  --mode=teleop \
+  --dataset.repo_id=my_org/my_arm_test \
+  --dataset.single_task="Describe the task here" \
+  --dataset.fps=30
+```
+
+Raw on-disk 采集：
+
+```bash
+python -m lerobot.scripts.lerobot_raw_record \
+  --robot.type=bi_my_arm_follower \
+  --teleop.type=bi_pico_my_arm_teleop \
+  --mode=teleop \
+  --dataset.repo_id=my_org/my_arm_raw_test \
+  --dataset.single_task="Describe the task here" \
+  --dataset.fps=30
+```
+
+HIL 加 policy 采集时，policy 必须和当前 robot 的 action 和 observation schema 完全兼容：
+
+```bash
+python -m lerobot.scripts.lerobot_hil_record \
+  --robot.type=bi_my_arm_follower \
+  --teleop.type=bi_pico_my_arm_teleop \
+  --mode=hil \
+  --policy.path=/path/to/policy \
+  --dataset.repo_id=my_org/my_arm_hil_test \
+  --dataset.single_task="Describe the task here" \
+  --dataset.fps=30
+```
+
+只要 action key、camera key、图像尺寸或 observation 名字变了，旧 policy 和旧 dataset stats 通常就不能直接复用。
+
+## 11. 验收标准
+
+达到下面条件后，再开始正式采集：
+
+- 新机械臂 SDK 和新相机 SDK 在当前 Python 环境中导入稳定。
+- `robot.action_features` 和 `robot.observation_features` 在未连接硬件时就正确。
+- `robot.connect()`、连续 `get_observation()`、连续 `send_action()`、`disconnect()` 都稳定，且不会泄漏线程或句柄。
+- 相机帧 shape、颜色顺序、FPS、延迟稳定。
+- Pico teleop action key 和 robot action key 完全一致。
+- `teleop.attach(robot)` 在 `teleop.connect()` 前调用，并且左右臂 attach 正确。
+- URDF IK 控制的是目标 TCP，关节顺序没有错。
+- home button 会去安全、可达、无碰撞的位置。
+- HIL 模式从 policy 切到 teleop correction 时动作连续。
+- 能完成一小段 raw recording，并能检查 parquet 标量数据和相机图片。
+
+## 12. 常见问题
+
+- `ValueError: Error creating robot with config`：config class 注册了，但 factory helper 没有实例化新 class。
+- CLI 不能解析 `--robot.type`：采集脚本没有在 parser 解析前 import 新 config 模块。
+- dataset 创建阶段就失败：`observation_features` 或 `action_features` 依赖了真实硬件连接状态。
+- teleop 动作无效：teleop action key 和 robot action key 不一致。
+- 左手柄动了右臂：双臂 prefix 拆分或合并写错。
+- 相机图片没进数据集：相机 key 没进 `observation_features`，或者 camera config 没有写 `width`、`height`、`fps`。
+- 控制循环卡顿：camera `async_read()` 阻塞太久，需要实现 `read_latest()` 和 stale-frame 检测。
+- HIL 人工接管第一帧跳变：没有实现 `prime_action()`，或没有在 handoff 时锁定 Pico reference pose。
+- IK 方向不对：URDF base frame、Pico 到 robot base 的坐标映射、`xr_yaw_quadrants` 或 `ee_link` 配错。
+- 断开连接时机械臂下坠：电机 disable 行为不适合当前姿态，正式确认前不要激进地下使能。

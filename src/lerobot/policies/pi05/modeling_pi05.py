@@ -30,6 +30,7 @@ from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoTokenizer
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING or _transformers_available:
     )
 else:
     CONFIG_MAPPING = None
+    AutoTokenizer = None
     modeling_gemma = None
     PiGemmaForCausalLM = None
     _gated_residual = None
@@ -53,6 +55,8 @@ from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_TOKENS,
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
@@ -135,6 +139,59 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
+
+
+def compute_subtask_ce_loss_per_sample(
+    subtask_hidden: Tensor,
+    subtask_tokens: Tensor,
+    subtask_masks: Tensor,
+    lm_head: nn.Module,
+) -> Tensor:
+    """Compute masked next-token CE for the AR subtask segment."""
+    if subtask_hidden.shape[1] < 2:
+        return torch.zeros(
+            subtask_hidden.shape[0],
+            dtype=torch.float32,
+            device=subtask_hidden.device,
+        )
+
+    weight = getattr(lm_head, "weight", None)
+    if weight is not None:
+        subtask_hidden = subtask_hidden.to(dtype=weight.dtype)
+
+    logits = lm_head(subtask_hidden).to(dtype=torch.float32)
+    logits = logits[:, :-1, :]
+    targets = subtask_tokens[:, 1:]
+    target_masks = subtask_masks[:, 1:].to(dtype=torch.bool)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+    ).reshape(targets.shape)
+
+    masked_loss = loss * target_masks.to(dtype=loss.dtype)
+    token_counts = target_masks.sum(dim=1)
+    return masked_loss.sum(dim=1) / token_counts.clamp(min=1).to(dtype=masked_loss.dtype)
+
+
+def apply_subtask_attention_dropout(
+    att_2d_masks: Tensor,
+    subtask_start: int,
+    subtask_end: int,
+    suffix_len: int,
+    dropout_prob: float,
+    training: bool,
+) -> Tensor:
+    """Drop suffix attention to subtask columns for per-sample robustness training."""
+    if not training or dropout_prob <= 0.0 or subtask_start >= subtask_end:
+        return att_2d_masks
+
+    drop = torch.rand(att_2d_masks.shape[0], device=att_2d_masks.device) < dropout_prob
+    if drop.any():
+        att_2d_masks = att_2d_masks.clone()
+        att_2d_masks[drop, -suffix_len:, subtask_start:subtask_end] = False
+    return att_2d_masks
 
 
 def pad_vector(vector, new_dim):
@@ -554,6 +611,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        self.subtask_seed_token_ids: Tensor | None = None
+        self.subtask_eos_token_id: int | None = None
+        self._last_subtask_tokens: Tensor | None = None
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -638,7 +698,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        subtask_tokens=None,
+        subtask_masks=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -670,6 +736,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if subtask_tokens is not None:
+            if subtask_masks is None:
+                raise ValueError("subtask_masks must be provided when subtask_tokens is provided")
+            subtask_emb = self._apply_checkpoint(lang_embed_func, subtask_tokens)
+            embs.append(subtask_emb)
+            pad_masks.append(subtask_masks)
+
+            num_subtask_embs = subtask_emb.shape[1]
+            att_masks += [1] * num_subtask_embs
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -727,7 +803,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        subtask_tokens=None,
+        subtask_masks=None,
+    ) -> tuple[Tensor, Tensor | None]:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -739,8 +826,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        has_subtask = subtask_tokens is not None and subtask_masks is not None
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            subtask_tokens=subtask_tokens,
+            subtask_masks=subtask_masks,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        subtask_start = None
+        subtask_end = None
+        if has_subtask:
+            subtask_end = prefix_pad_masks.shape[1]
+            subtask_start = subtask_end - subtask_tokens.shape[1]
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -753,12 +853,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        if has_subtask:
+            att_2d_masks = apply_subtask_attention_dropout(
+                att_2d_masks,
+                subtask_start,
+                subtask_end,
+                suffix_pad_masks.shape[1],
+                self.config.subtask_dropout_prob,
+                self.training,
+            )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -766,11 +875,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
+
+        ce_loss_per_sample = None
+        if has_subtask:
+            subtask_hidden = prefix_out[:, subtask_start:subtask_end]
+            ce_loss_per_sample = compute_subtask_ce_loss_per_sample(
+                subtask_hidden,
+                subtask_tokens,
+                subtask_masks,
+                self.paligemma_with_expert.paligemma.lm_head,
+            )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -780,7 +899,114 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        return F.mse_loss(u_t, v_t, reduction="none"), ce_loss_per_sample
+
+    def _embed_language_generation_tokens(self, token_ids: Tensor, reference_embs: Tensor) -> Tensor:
+        token_embs = self.paligemma_with_expert.embed_language_tokens(token_ids)
+        token_embs = token_embs * math.sqrt(token_embs.shape[-1])
+        return token_embs.to(dtype=reference_embs.dtype)
+
+    def _sample_subtask_token(self, hidden: Tensor, temperature: float) -> Tensor:
+        lm_head = self.paligemma_with_expert.paligemma.lm_head
+        weight = getattr(lm_head, "weight", None)
+        if weight is not None:
+            hidden = hidden.to(dtype=weight.dtype)
+        logits = lm_head(hidden[:, -1:, :]).to(dtype=torch.float32)
+        if temperature > 0:
+            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+        return torch.argmax(logits[:, -1], dim=-1, keepdim=True)
+
+    def _build_subtask_seed_attention_mask(self, prefix_pad_masks: Tensor, seed_len: int) -> Tensor:
+        batch_size, prefix_len = prefix_pad_masks.shape
+        prefix_att = prefix_pad_masks[:, None, :].expand(batch_size, seed_len, prefix_len)
+        seed_causal = torch.tril(
+            torch.ones(seed_len, seed_len, dtype=torch.bool, device=prefix_pad_masks.device)
+        )
+        seed_att = seed_causal[None, :, :].expand(batch_size, seed_len, seed_len)
+        return torch.cat([prefix_att, seed_att], dim=2)
+
+    def _generate_subtask(
+        self,
+        past_key_values,
+        prefix_pad_masks: Tensor,
+        seed_token_ids: Tensor,
+        eos_token_id: int,
+        prefix_reference_embs: Tensor,
+    ) -> tuple[Tensor, Tensor, object]:
+        """Generate AR subtask tokens and leave their KV entries in the prefix cache."""
+        if seed_token_ids.ndim != 1 or seed_token_ids.numel() == 0:
+            raise ValueError("subtask seed_token_ids must be a non-empty 1D tensor")
+
+        bsize = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
+        max_decode_tokens = self.config.subtask_max_decode_tokens
+        temperature = self.config.subtask_decode_temperature
+
+        seed_token_ids = seed_token_ids.to(device=device, dtype=torch.long)
+        seed_tokens = seed_token_ids[None, :].expand(bsize, seed_token_ids.numel())
+        seed_embs = self._embed_language_generation_tokens(seed_tokens, prefix_reference_embs)
+
+        seed_att_2d_masks = self._build_subtask_seed_attention_mask(prefix_pad_masks, seed_tokens.shape[1])
+        seed_att_4d = self._prepare_attention_masks_4d(seed_att_2d_masks)
+        prefix_offsets = prefix_pad_masks.sum(dim=1, keepdim=True)
+        seed_position_ids = prefix_offsets + torch.arange(seed_tokens.shape[1], device=device)[None, :]
+
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        (seed_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=seed_att_4d,
+            position_ids=seed_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[seed_embs, None],
+            use_cache=True,
+            adarms_cond=[None, None],
+        )
+
+        current_pad_masks = torch.cat(
+            [prefix_pad_masks, torch.ones((bsize, seed_tokens.shape[1]), dtype=torch.bool, device=device)],
+            dim=1,
+        )
+        generated_tokens = []
+        finished = torch.zeros(bsize, dtype=torch.bool, device=device)
+        next_token = self._sample_subtask_token(seed_out, temperature)
+
+        for _ in range(max_decode_tokens):
+            valid_token = ~finished
+            token_to_add = torch.where(
+                valid_token[:, None],
+                next_token,
+                torch.zeros_like(next_token),
+            )
+            generated_tokens.append(token_to_add.squeeze(1))
+
+            current_pad_masks = torch.cat([current_pad_masks, valid_token[:, None]], dim=1)
+            token_embs = self._embed_language_generation_tokens(token_to_add, prefix_reference_embs)
+            position_ids = current_pad_masks.sum(dim=1, keepdim=True) - 1
+            step_att_4d = self._prepare_attention_masks_4d(current_pad_masks[:, None, :])
+
+            (step_out, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=step_att_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[token_embs, None],
+                use_cache=True,
+                adarms_cond=[None, None],
+            )
+
+            finished = finished | ((token_to_add.squeeze(1) == eos_token_id) & valid_token)
+            if finished.all():
+                break
+
+            next_token = self._sample_subtask_token(step_out, temperature)
+
+        if generated_tokens:
+            generated_tokens = torch.stack(generated_tokens, dim=1)
+            full_tokens = torch.cat([seed_tokens, generated_tokens], dim=1)
+        else:
+            full_tokens = seed_tokens
+
+        self._last_subtask_tokens = full_tokens
+        return full_tokens, current_pad_masks, past_key_values
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -799,6 +1025,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = tokens.shape[0]
         device = tokens.device
+        self._last_subtask_tokens = None
 
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
@@ -823,6 +1050,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        if self.config.predict_subtask and self.config.subtask_generate_at_inference:
+            if self.subtask_seed_token_ids is None or self.subtask_eos_token_id is None:
+                raise ValueError("Subtask AR inference requires seed and EOS token ids")
+            _, prefix_pad_masks, past_key_values = self._generate_subtask(
+                past_key_values=past_key_values,
+                prefix_pad_masks=prefix_pad_masks,
+                seed_token_ids=self.subtask_seed_token_ids,
+                eos_token_id=self.subtask_eos_token_id,
+                prefix_reference_embs=prefix_embs,
+            )
 
         dt = -1.0 / num_steps
 
@@ -920,10 +1158,28 @@ class PI05Policy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self._paligemma_tokenizer = None
+        self.last_subtask_text = ""
+        self._last_logged_subtask_text = None
 
         # Initialize the core PI05 model
         self.init_rtc_processor()
         self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        if config.predict_subtask:
+            if AutoTokenizer is None:
+                raise ImportError("AutoTokenizer is required for PI05 subtask AR inference")
+            self._paligemma_tokenizer = AutoTokenizer.from_pretrained(
+                "google/paligemma-3b-pt-224",
+                add_bos_token=False,
+            )
+            seed_token_ids = self._paligemma_tokenizer.encode("Subtask:", add_special_tokens=False)
+            if len(seed_token_ids) == 0:
+                raise ValueError("PaliGemma tokenizer produced an empty subtask seed")
+            eos_token_id = self._paligemma_tokenizer.eos_token_id
+            if eos_token_id is None:
+                raise ValueError("PaliGemma tokenizer must define eos_token_id for subtask AR")
+            self.model.subtask_seed_token_ids = torch.tensor(seed_token_ids, dtype=torch.long)
+            self.model.subtask_eos_token_id = int(eos_token_id)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1238,6 +1494,19 @@ class PI05Policy(PreTrainedPolicy):
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        if self.config.predict_subtask and self._paligemma_tokenizer is not None:
+            subtask_tokens = self.model._last_subtask_tokens
+            if subtask_tokens is not None:
+                decoded = self._paligemma_tokenizer.batch_decode(
+                    subtask_tokens.detach().cpu().tolist(),
+                    skip_special_tokens=True,
+                )
+                decoded = [text.strip() for text in decoded]
+                self.last_subtask_text = decoded[0] if len(decoded) == 1 else decoded
+                log_text = self.last_subtask_text if isinstance(self.last_subtask_text, str) else str(decoded)
+                if log_text != self._last_logged_subtask_text:
+                    logging.info("[subtask] %s", log_text)
+                    self._last_logged_subtask_text = log_text
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1257,28 +1526,59 @@ class PI05Policy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        subtask_tokens = None
+        subtask_masks = None
+        if self.config.predict_subtask:
+            subtask_tokens = batch.get(OBS_LANGUAGE_SUBTASK_TOKENS)
+            subtask_masks = batch.get(OBS_LANGUAGE_SUBTASK_ATTENTION_MASK)
 
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        model_output = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            subtask_tokens=subtask_tokens,
+            subtask_masks=subtask_masks,
+        )
+        if isinstance(model_output, tuple):
+            losses, ce_loss_per_sample = model_output
+        else:
+            losses = model_output
+            ce_loss_per_sample = None
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        fm_loss = losses.mean()
+        if ce_loss_per_sample is None:
+            ce_loss_per_sample = torch.zeros(
+                losses.shape[0],
+                dtype=losses.dtype,
+                device=losses.device,
+            )
+        ce_loss = ce_loss_per_sample.mean()
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "fm_loss": fm_loss.item(),
+            "ce_loss": ce_loss.item(),
         }
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_fm_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = (
+                per_sample_fm_loss + self.config.subtask_ce_loss_weight * ce_loss_per_sample
+            )
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = fm_loss + self.config.subtask_ce_loss_weight * ce_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

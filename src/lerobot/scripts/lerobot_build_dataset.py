@@ -211,11 +211,17 @@ def _load_extras_schema(ep_dirs: list[Path]) -> tuple[dict, set[str]]:
                 "shape": (None,),
                 "names": None,
             }
-        elif (
-            pa.types.is_floating(pa_type)
-            or pa.types.is_integer(pa_type)
-            or pa.types.is_boolean(pa_type)
-        ):
+        elif pa.types.is_floating(pa_type):
+            if pa.types.is_float16(pa_type):
+                dtype = "float16"
+            elif pa.types.is_float32(pa_type):
+                dtype = "float32"
+            elif pa.types.is_float64(pa_type):
+                dtype = "float64"
+            else:
+                raise ValueError(f"Unsupported extras floating column type for '{name}': {pa_type}")
+            extras_features[name] = {"dtype": dtype, "shape": (1,), "names": None}
+        elif pa.types.is_integer(pa_type) or pa.types.is_boolean(pa_type):
             extras_features[name] = {"dtype": str(pa_type), "shape": (1,), "names": None}
         else:
             raise ValueError(f"Unsupported extras column type for '{name}': {pa_type}")
@@ -248,11 +254,15 @@ def _safe_rmtree(root: Path, reason: str) -> None:
     shutil.rmtree(root)
 
 
-def _load_extras_row_as_dict(row: dict) -> dict:
+def _load_extras_row_as_dict(row: dict, features: dict) -> dict:
     out = {}
     for k, v in row.items():
+        feature = features.get(k, {})
+        dtype = feature.get("dtype")
         if isinstance(v, list):
-            out[k] = np.asarray(v, dtype=np.float32)
+            out[k] = np.asarray(v, dtype=dtype or np.float32)
+        elif dtype and dtype != "string":
+            out[k] = np.asarray([v], dtype=dtype)
         else:
             out[k] = v
     return out
@@ -438,7 +448,7 @@ def _build_one_episode(
             cam_subdir=cam_subdir,
         )
         if extras_rows:
-            extras_dict = _load_extras_row_as_dict(extras_rows[i])
+            extras_dict = _load_extras_row_as_dict(extras_rows[i], final_features)
             for k in extras_keys:
                 if k in extras_dict:
                     frame[k] = extras_dict[k]

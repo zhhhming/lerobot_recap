@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -88,6 +89,15 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Subtask AR generation
+    predict_subtask: bool = False
+    subtask_max_tokens: int = 48
+    subtask_ce_loss_weight: float = 0.25
+    subtask_dropout_prob: float = 0.2
+    subtask_generate_at_inference: bool = True
+    subtask_max_decode_tokens: int = 48
+    subtask_decode_temperature: float = 0.0
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -121,6 +131,16 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.predict_subtask and self.train_expert_only:
+            raise ValueError("predict_subtask=True requires train_expert_only=False so the VLM can learn")
+
+        if self.subtask_max_decode_tokens > self.subtask_max_tokens:
+            warnings.warn(
+                "subtask_max_decode_tokens is greater than subtask_max_tokens; "
+                "inference may generate longer subtask text than the training AR segment.",
+                stacklevel=2,
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

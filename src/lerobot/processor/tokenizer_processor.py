@@ -81,6 +81,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
+    subtask_max_length: int = 48
+    tokenize_subtask: bool = False
 
     # Internal tokenizer instance (not part of the config)
     input_tokenizer: Any = field(default=None, init=False, repr=False)
@@ -204,10 +206,14 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         new_observation[OBS_LANGUAGE_TOKENS] = tokenized_prompt["input_ids"]
         new_observation[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_prompt["attention_mask"].to(dtype=torch.bool)
 
-        # Tokenize subtask if available
-        subtask = self.get_subtask(self.transition)
+        # Tokenize subtask only when explicitly enabled. The default remains disabled
+        # because several policies may carry a raw "subtask" field without using AR text.
+        if self.tokenize_subtask:
+            subtask = self.get_subtask(self.transition)
+        else:
+            subtask = None
         if subtask is not None:
-            tokenized_subtask = self._tokenize_text(subtask)
+            tokenized_subtask = self._tokenize_subtask(subtask)
 
             # Move new tokenized tensors to the detected device
             if target_device is not None:
@@ -269,6 +275,38 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             return_tensors="pt",
         )
 
+    def _tokenize_subtask(self, text: str | list[str]) -> dict[str, torch.Tensor]:
+        texts = [text] if isinstance(text, str) else text
+        input_ids = torch.zeros(len(texts), self.subtask_max_length, dtype=torch.long)
+        attention_mask = torch.zeros(len(texts), self.subtask_max_length, dtype=torch.bool)
+
+        eos_token_id = getattr(self.input_tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            raise ValueError("Tokenizer must expose eos_token_id to tokenize subtask text")
+
+        for i, item in enumerate(texts):
+            if not item:
+                continue
+
+            token_ids = self.input_tokenizer.encode(item, add_special_tokens=False)
+            token_ids = list(token_ids) + [eos_token_id]
+            if len(token_ids) > self.subtask_max_length:
+                logging.warning(
+                    "Subtask token length (%d) exceeds max length (%d), truncating.",
+                    len(token_ids),
+                    self.subtask_max_length,
+                )
+                token_ids = token_ids[: self.subtask_max_length]
+
+            token_tensor = torch.tensor(token_ids, dtype=torch.long)
+            input_ids[i, : len(token_ids)] = token_tensor
+            attention_mask[i, : len(token_ids)] = True
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
     def get_config(self) -> dict[str, Any]:
         """
         Returns the serializable configuration of the processor.
@@ -285,6 +323,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             "padding_side": self.padding_side,
             "padding": self.padding,
             "truncation": self.truncation,
+            "subtask_max_length": self.subtask_max_length,
+            "tokenize_subtask": self.tokenize_subtask,
         }
 
         # Only save tokenizer_name if it was used to create the tokenizer
@@ -319,6 +359,17 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_ATTENTION_MASK] = PolicyFeature(
                 type=FeatureType.LANGUAGE, shape=(self.max_length,)
             )
+
+        if self.tokenize_subtask:
+            if OBS_LANGUAGE_SUBTASK_TOKENS not in features[PipelineFeatureType.OBSERVATION]:
+                features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_SUBTASK_TOKENS] = PolicyFeature(
+                    type=FeatureType.LANGUAGE, shape=(self.subtask_max_length,)
+                )
+
+            if OBS_LANGUAGE_SUBTASK_ATTENTION_MASK not in features[PipelineFeatureType.OBSERVATION]:
+                features[PipelineFeatureType.OBSERVATION][
+                    OBS_LANGUAGE_SUBTASK_ATTENTION_MASK
+                ] = PolicyFeature(type=FeatureType.LANGUAGE, shape=(self.subtask_max_length,))
 
         return features
 

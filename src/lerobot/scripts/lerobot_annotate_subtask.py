@@ -180,6 +180,30 @@ def default_episode_annotation(length: int) -> dict:
 # --------------------------------------------------------------------------
 # Export to extras.parquet
 # --------------------------------------------------------------------------
+SUBTASK_PROGRESS_COLUMN = "subtask_progress"
+
+
+def _compute_subtask_progress(labels: list, length: int) -> list[float]:
+    """Return per-frame progress within contiguous non-empty subtask segments."""
+    progress = [0.0] * length
+    i = 0
+    while i < length:
+        label = labels[i]
+        if not isinstance(label, str) or not label.strip():
+            i += 1
+            continue
+
+        j = i + 1
+        while j < length and labels[j] == label:
+            j += 1
+
+        segment_len = j - i
+        for offset in range(segment_len):
+            progress[i + offset] = (offset + 1) / segment_len
+        i = j
+    return progress
+
+
 def export_extras(run: RawRun) -> dict:
     cfg = load_config(run)
     ann = load_annotations(run)
@@ -200,6 +224,7 @@ def export_extras(run: RawRun) -> dict:
 
         unlabeled = sum(1 for v in labels if v in (None, ""))
         values = [(v if v not in (None,) else default_value) for v in labels]
+        progress = _compute_subtask_progress(labels, length)
 
         ep_dir = run.episode_dir(idx)
         extras_path = ep_dir / "extras.parquet"
@@ -210,7 +235,7 @@ def export_extras(run: RawRun) -> dict:
             try:
                 existing = pq.read_table(extras_path)
                 for name in existing.column_names:
-                    if name == feature_name:
+                    if name in (feature_name, SUBTASK_PROGRESS_COLUMN):
                         continue
                     col = existing.column(name).to_pylist()
                     if len(col) == length:
@@ -218,8 +243,11 @@ def export_extras(run: RawRun) -> dict:
             except Exception:
                 logger.warning("Could not read existing %s; overwriting.", extras_path)
 
-        arrays = [pa.array(values, type=pa.string())]
-        names = [feature_name]
+        arrays = [
+            pa.array(values, type=pa.string()),
+            pa.array(progress, type=pa.float32()),
+        ]
+        names = [feature_name, SUBTASK_PROGRESS_COLUMN]
         for name, col in other_cols.items():
             arrays.append(pa.array(col))
             names.append(name)

@@ -46,7 +46,7 @@ class PicoNeroTeleopConfigBase:
     trigger_deadzone: float = 0.02
     # Scale trigger -> gripper opening range. 1.0 keeps the calibrated full
     # open/close span; 0.5 limits trigger-released opening to half span.
-    trigger_gripper_scale: float = 0.5
+    trigger_gripper_scale: float = 0.5 #划火柴:0.5,炒鸡蛋:0.65
 
     # Home / zero behavior. home_button: "Y" (left arm by convention) or "B" (right).
     home_button: str = "Y"
