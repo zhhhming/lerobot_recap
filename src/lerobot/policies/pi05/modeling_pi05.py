@@ -1514,7 +1514,13 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        reduction: str = "mean",
+        *,
+        return_loss_components: bool = False,
+    ) -> tuple[Tensor, dict] | tuple[Tensor, Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
         Args:
@@ -1522,6 +1528,8 @@ class PI05Policy(PreTrainedPolicy):
             reduction: How to reduce the loss. Options:
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+            return_loss_components: With ``reduction="none"``, return per-sample FM and
+                subtask CE separately so advantage weighting applies only to FM.
         """
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
@@ -1568,9 +1576,17 @@ class PI05Policy(PreTrainedPolicy):
             "ce_loss": ce_loss.item(),
         }
 
+        per_sample_fm_loss = losses.mean(dim=(1, 2))
+        if return_loss_components:
+            if reduction != "none":
+                raise ValueError("return_loss_components=True requires reduction='none'")
+            unweighted_loss = (
+                per_sample_fm_loss + self.config.subtask_ce_loss_weight * ce_loss_per_sample
+            )
+            loss_dict["loss"] = unweighted_loss.mean().item()
+            return per_sample_fm_loss, ce_loss_per_sample, loss_dict
+
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_fm_loss = losses.mean(dim=(1, 2))
             per_sample_loss = (
                 per_sample_fm_loss + self.config.subtask_ce_loss_weight * ce_loss_per_sample
             )

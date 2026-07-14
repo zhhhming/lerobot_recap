@@ -26,6 +26,7 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
+    AdvantageConditionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
@@ -159,11 +160,21 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
+    ]
+    if config.use_advantage_conditioning:
+        input_steps.append(
+            AdvantageConditionProcessorStep(
+                label_key=config.advantage_label_key,
+                condition_format=config.advantage_condition_format,
+                inference_label=config.inference_advantage_label,
+            )
+        )
+    input_steps.append(
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
             omit_action_suffix=config.predict_subtask,
-        ),
-    ]
+        )
+    )
     if config.predict_subtask:
         input_steps.append(SubtaskTextProcessorStep())
     input_steps.extend(
@@ -173,6 +184,7 @@ def make_pi05_pre_post_processors(
                 max_length=config.tokenizer_max_length,
                 padding_side="right",
                 padding="max_length",
+                truncation_side="left" if config.use_advantage_conditioning else None,
                 tokenize_subtask=config.predict_subtask,
                 subtask_max_length=config.subtask_max_tokens,
             ),

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Advantage Labeler</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar">
+        <header>
+          <h1>Advantage Labeler</h1>
+          <p id="runMeta"></p>
+          <p id="syntheticWarning" class="warning" hidden></p>
+        </header>
+        <section class="controls">
+          <label>
+            Mode
+            <select id="valueMode">
+              <option value="global">global</option>
+              <option value="subtask">subtask</option>
+            </select>
+          </label>
+          <label>
+            Sort
+            <select id="sortOrder">
+              <option value="desc">high to low</option>
+              <option value="asc">low to high</option>
+            </select>
+          </label>
+          <label>
+            Tie policy
+            <select id="tiePolicy">
+              <option value="exact_count">exact count</option>
+              <option value="include_all">include all ties</option>
+            </select>
+          </label>
+          <label>
+            Positive %
+            <input id="topPercent" type="range" min="0" max="100" value="80" />
+            <span id="topPercentText">80%</span>
+          </label>
+          <button id="exportBtn">Export</button>
+        </section>
+        <section class="counts" id="counts"></section>
+        <section class="markerRow">
+          <span>10%</span><span>20%</span><span>30%</span><span>80%</span>
+        </section>
+        <ol id="chunkList" class="chunkList"></ol>
+        <nav class="pagination">
+          <button id="prevPage">Previous page</button>
+          <span id="pageInfo">Page 1 / 1</span>
+          <button id="nextPage">Next page</button>
+        </nav>
+      </aside>
+      <section class="viewer">
+        <div class="viewerHeader">
+          <div>
+            <h2 id="chunkTitle">Select a chunk</h2>
+            <p id="chunkDetails"></p>
+          </div>
+          <label>
+            Camera
+            <select id="cameraSelect"></select>
+          </label>
+        </div>
+        <div class="imageWrap">
+          <img id="frameImage" alt="" />
+        </div>
+        <div class="playbar">
+          <button id="prevFrame">Prev</button>
+          <input id="frameOffset" type="range" min="0" max="0" value="0" />
+          <button id="nextFrame">Next</button>
+        </div>
+        <div class="labelControls">
+          <button data-label="positive">Positive</button>
+          <button data-label="negative">Negative</button>
+          <button data-label="ignore">Ignore</button>
+          <button id="clearOverride">Clear override</button>
+        </div>
+        <p id="status"></p>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

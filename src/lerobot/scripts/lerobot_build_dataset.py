@@ -39,6 +39,21 @@ from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
+from lerobot.value_function.raw_io import (
+    StalePipelineArtifactError,
+    assert_stage_dependencies_current,
+    read_value_function_metadata,
+)
+from lerobot.value_function.schema import (
+    ADVANTAGE_GROUP_ID_GLOBAL,
+    ADVANTAGE_GROUP_ID_SUBTASK,
+    ADVANTAGE_LABEL_GLOBAL,
+    ADVANTAGE_LABEL_SUBTASK,
+    ADVANTAGE_LABELING_STAGE_PREFIX,
+    ADVANTAGE_LOSS_WEIGHT_GLOBAL,
+    ADVANTAGE_LOSS_WEIGHT_SUBTASK,
+    ADVANTAGE_WEIGHTS_STAGE_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,9 +207,9 @@ def _load_extras_schema(ep_dirs: list[Path]) -> tuple[dict, set[str]]:
     first_schema = pq.read_schema(extras_paths[0][1])
     for ep, p in extras_paths[1:]:
         sch = pq.read_schema(p)
-        if sch.names != first_schema.names:
+        if not sch.equals(first_schema, check_metadata=False):
             raise ValueError(
-                f"extras.parquet schema differs in {ep}: columns {sch.names} vs {first_schema.names}"
+                f"extras.parquet schema differs in {ep}: {sch} vs {first_schema}"
             )
 
     extras_features: dict = {}
@@ -226,6 +241,63 @@ def _load_extras_schema(ep_dirs: list[Path]) -> tuple[dict, set[str]]:
         else:
             raise ValueError(f"Unsupported extras column type for '{name}': {pa_type}")
     return extras_features, set(first_schema.names)
+
+
+def _validate_selected_value_pipeline_artifacts(
+    run_dirs: list[Path], selected_extras: set[str]
+) -> None:
+    """Reject stale or untracked label/weight artifacts selected for dataset build."""
+
+    stage_columns = {
+        f"{ADVANTAGE_LABELING_STAGE_PREFIX}.global": {ADVANTAGE_LABEL_GLOBAL},
+        f"{ADVANTAGE_LABELING_STAGE_PREFIX}.subtask": {ADVANTAGE_LABEL_SUBTASK},
+        f"{ADVANTAGE_WEIGHTS_STAGE_PREFIX}.global": {
+            ADVANTAGE_GROUP_ID_GLOBAL,
+            ADVANTAGE_LOSS_WEIGHT_GLOBAL,
+        },
+        f"{ADVANTAGE_WEIGHTS_STAGE_PREFIX}.subtask": {
+            ADVANTAGE_GROUP_ID_SUBTASK,
+            ADVANTAGE_LOSS_WEIGHT_SUBTASK,
+        },
+    }
+    required = {
+        stage_name: sorted(columns & selected_extras)
+        for stage_name, columns in stage_columns.items()
+        if columns & selected_extras
+    }
+    if not required:
+        return
+
+    for run_dir in run_dirs:
+        try:
+            metadata = read_value_function_metadata(run_dir)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"Selected value-pipeline label/weight columns from '{run_dir}', but "
+                "value_function_meta.json is missing"
+            ) from exc
+        stages = metadata.get("stages") or {}
+        synthetic_stages: list[str] = []
+        for stage_name, columns in required.items():
+            try:
+                assert_stage_dependencies_current(run_dir, stage_name)
+            except (ValueError, StalePipelineArtifactError) as exc:
+                raise type(exc)(f"Cannot build dataset from '{run_dir}': {exc}") from exc
+            stage = stages.get(stage_name) or {}
+            missing = sorted(set(columns) - set(stage.get("output_columns") or []))
+            if missing:
+                raise ValueError(
+                    f"Pipeline stage '{stage_name}' in '{run_dir}' does not declare selected "
+                    f"output columns: {missing}"
+                )
+            if stage.get("synthetic"):
+                synthetic_stages.append(stage_name)
+        if synthetic_stages:
+            logger.warning(
+                "Building SYNTHETIC / NOT FOR EXPERIMENT value-pipeline artifacts from %s: %s",
+                run_dir,
+                sorted(synthetic_stages),
+            )
 
 
 def _resolve_output_root(repo_id: str, root: str | None) -> Path:
@@ -344,6 +416,7 @@ def build_dataset(cfg: BuildDatasetConfig) -> LeRobotDataset | None:
         if v["dtype"] not in ("image", "video") and k not in extras_columns
     ]
     extras_keys = [k for k in extras_columns if k in final_features]
+    _validate_selected_value_pipeline_artifacts(run_dirs, set(extras_keys))
 
     cam_subdir = {k: k.split(".")[-1] for k in image_keys}
 

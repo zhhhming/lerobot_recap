@@ -181,6 +181,32 @@ def test_pi0_policy_forward_combines_fm_and_ce_loss_none():
     assert loss_dict["loss"] == pytest.approx(expected.mean().item())
 
 
+def test_pi0_policy_forward_exposes_separate_loss_components():
+    losses = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    ce_loss_per_sample = torch.tensor([0.5, 1.5])
+    policy = _FakePI0Policy(_FakeModel(losses, ce_loss_per_sample), predict_subtask=True, weight=0.5)
+
+    fm, ce, loss_dict = PI0Policy.forward(
+        policy,
+        _make_policy_batch(),
+        reduction="none",
+        return_loss_components=True,
+    )
+
+    assert torch.allclose(fm, losses.mean(dim=(1, 2)))
+    assert torch.equal(ce, ce_loss_per_sample)
+    expected_total = fm + 0.5 * ce
+    assert loss_dict["loss"] == pytest.approx(expected_total.mean().item())
+
+    with pytest.raises(ValueError, match="requires reduction='none'"):
+        PI0Policy.forward(
+            policy,
+            _make_policy_batch(),
+            reduction="mean",
+            return_loss_components=True,
+        )
+
+
 def test_pi0_policy_forward_without_subtask_keeps_fm_only_behavior():
     losses = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     fake_model = _FakeModel(losses, None)

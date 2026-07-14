@@ -220,6 +220,14 @@ lerobot-hil-record="lerobot.scripts.lerobot_hil_record:main"
 lerobot-raw-record="lerobot.scripts.lerobot_raw_record:main"
 lerobot-build-dataset="lerobot.scripts.lerobot_build_dataset:main"
 lerobot-annotate-subtask="lerobot.scripts.lerobot_annotate_subtask:main"
+lerobot-value-prepare-targets="lerobot.scripts.lerobot_value_prepare_targets:main"
+lerobot-value-mock-predictions="lerobot.scripts.lerobot_value_mock_predictions:main"
+lerobot-train-value-function="lerobot.scripts.lerobot_train_value_function:main"
+lerobot-value-infer="lerobot.scripts.lerobot_value_infer:main"
+lerobot-value-viz="lerobot.scripts.lerobot_value_viz:main"
+lerobot-compute-advantage="lerobot.scripts.lerobot_compute_advantage:main"
+lerobot-advantage-labeler="lerobot.scripts.lerobot_advantage_labeler:main"
+lerobot-compute-advantage-weights="lerobot.scripts.lerobot_compute_advantage_weights:main"
 lerobot-policy-deploy="lerobot.scripts.lerobot_policy_deploy:main"
 lerobot-push-dataset="lerobot.scripts.lerobot_push_dataset:main"
 lerobot-replay="lerobot.scripts.lerobot_replay:main"
@@ -237,7 +245,21 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
-lerobot = ["envs/*.json", "scripts/subtask_annotator/*.html", "scripts/subtask_annotator/*.js", "scripts/subtask_annotator/*.css"]
+lerobot = [
+    "envs/*.json",
+    "scripts/subtask_annotator/*.html",
+    "scripts/subtask_annotator/*.js",
+    "scripts/subtask_annotator/*.css",
+    "scripts/advantage_labeler/*.html",
+    "scripts/advantage_labeler/*.js",
+    "scripts/advantage_labeler/*.css",
+    "scripts/advantage_weight_viz/*.html",
+    "scripts/advantage_weight_viz/*.js",
+    "scripts/advantage_weight_viz/*.css",
+    "scripts/value_viz/*.html",
+    "scripts/value_viz/*.js",
+    "scripts/value_viz/*.css",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

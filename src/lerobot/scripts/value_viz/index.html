@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LeRobot Value Curves</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LeRobot · raw value inspection</p>
+          <h1>Value Curves</h1>
+          <p id="runMeta" class="muted">Loading raw run…</p>
+        </div>
+        <div class="topControls">
+          <label>Unit
+            <select id="unitSelect"><option value="norm">normalized</option><option value="frames">frames</option></select>
+          </label>
+          <label>Boundary
+            <select id="boundarySelect"></select>
+          </label>
+        </div>
+      </header>
+
+      <section id="warnings" class="warnings" aria-live="polite"></section>
+
+      <section class="workspace">
+        <aside class="episodesPanel panel">
+          <div class="panelHeader"><h2>Episodes</h2><span id="episodeCount" class="badge"></span></div>
+          <ol id="episodeList" class="episodeList"></ol>
+        </aside>
+
+        <section class="mainPanel">
+          <section class="viewer panel">
+            <div class="viewerHeader">
+              <div><h2 id="frameTitle">Select an episode</h2><p id="frameSubtask" class="muted"></p></div>
+              <label>Camera <select id="cameraSelect"></select></label>
+            </div>
+            <div class="imageWrap"><img id="frameImage" alt="Current raw frame" /></div>
+            <div class="scrubber">
+              <button id="prevFrame" type="button" aria-label="Previous frame">←</button>
+              <input id="frameSlider" type="range" min="0" max="0" value="0" />
+              <button id="nextFrame" type="button" aria-label="Next frame">→</button>
+            </div>
+            <p class="hint">Use ←/→ to move one frame. Hold Shift for ten frames.</p>
+          </section>
+
+          <section class="chartPanel panel">
+            <div class="chartHeader">
+              <div><h2>Remaining / elapsed value</h2><p id="chartMeta" class="muted"></p></div>
+              <label class="toggle"><input id="chunkToggle" type="checkbox" checked /> chunk segments</label>
+            </div>
+            <div id="seriesControls" class="seriesControls"></div>
+            <div class="chartWrap"><canvas id="valueChart" height="380"></canvas></div>
+            <div id="subtaskLegend" class="subtaskLegend"></div>
+          </section>
+
+          <section class="details panel">
+            <div><h2>Current frame values</h2><div id="currentValues" class="valueGrid"></div></div>
+            <div><h2>Chunk boundary split</h2><div id="chunkSegments" class="segmentList"></div></div>
+          </section>
+        </section>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

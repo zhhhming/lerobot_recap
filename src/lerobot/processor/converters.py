@@ -174,6 +174,13 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
+    advantage_data = {
+        key: _normalize_advantage_per_sample_value(key, value)
+        for key, value in batch.items()
+        if key.startswith("advantage_label_")
+        or key.startswith("advantage_loss_weight_")
+        or key == "advantage_condition_kept"
+    }
 
     return {
         **pad_keys,
@@ -183,7 +190,34 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         **index_key,
         **task_index_key,
         **episode_index_key,
+        **advantage_data,
     }
+
+
+def _normalize_advantage_per_sample_value(key: str, value: Any) -> Any:
+    """Normalize numeric advantage controls to one scalar per batch item.
+
+    Raw scalar extras are represented as shape ``(1,)`` features. Depending on
+    the dataset backend, DataLoader collation can produce ``[B]`` or ``[B, 1]``.
+    Per-sample losses use ``[B]``; retaining the singleton feature dimension
+    would silently broadcast them to ``[B, B]``. Labels remain string lists and
+    are passed through unchanged.
+    """
+
+    if key.startswith("advantage_label_"):
+        return value
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.ndim == 0:
+        return value.unsqueeze(0)
+    if value.ndim == 1:
+        return value
+    if value.ndim == 2 and value.shape[-1] == 1:
+        return value.squeeze(-1)
+    raise ValueError(
+        f"{key} must contain exactly one scalar per sample with shape [B] or [B, 1], "
+        f"got {tuple(value.shape)}"
+    )
 
 
 def create_transition(

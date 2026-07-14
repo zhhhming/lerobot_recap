@@ -38,6 +38,11 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.utils.advantage_weights import (
+    AdvantageWeights,
+    distributed_weighted_mean,
+    sample_advantage_condition_mask,
+)
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -66,6 +71,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    advantage_weights_provider: AdvantageWeights | None = None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -83,6 +89,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         rabc_weights_provider: Optional RABCWeights instance for sample weighting.
+        advantage_weights_provider: Optional provider for offline group-relative weights.
 
     Returns:
         A tuple containing:
@@ -92,16 +99,62 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
+    if rabc_weights_provider is not None and advantage_weights_provider is not None:
+        raise ValueError("RA-BC and advantage weighting cannot be active in the same update")
+
     # Get RA-BC weights if enabled
     rabc_batch_weights = None
     rabc_batch_stats = None
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
 
+    advantage_batch_weights = None
+    advantage_batch_stats = None
+    if advantage_weights_provider is not None:
+        advantage_batch_weights, advantage_batch_stats = (
+            advantage_weights_provider.compute_batch_weights(batch)
+        )
+
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
+        # Use per-sample loss when either weighting mode is enabled.
+        if advantage_batch_weights is not None:
+            per_sample_fm_loss, per_sample_subtask_ce, output_dict = policy.forward(
+                batch,
+                reduction="none",
+                return_loss_components=True,
+            )
+            weighted_fm_loss, global_weight_sum = distributed_weighted_mean(
+                per_sample_fm_loss,
+                advantage_batch_weights,
+                accelerator=accelerator,
+            )
+            subtask_ce_loss, _ = distributed_weighted_mean(
+                per_sample_subtask_ce,
+                torch.ones_like(per_sample_subtask_ce),
+                accelerator=accelerator,
+            )
+            unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+            subtask_ce_loss_weight = getattr(
+                unwrapped_policy.config, "subtask_ce_loss_weight", 0.0
+            )
+            loss = weighted_fm_loss + subtask_ce_loss_weight * subtask_ce_loss
+            output_dict.update(
+                {
+                    "loss": loss.detach().item(),
+                    "advantage_weighted_fm_loss": weighted_fm_loss.detach().item(),
+                    "advantage_weight_sum": global_weight_sum.item(),
+                    "advantage_mean_weight": advantage_batch_stats["mean_weight"],
+                    "advantage_num_positive": advantage_batch_stats["num_positive"],
+                    "advantage_num_negative": advantage_batch_stats["num_negative"],
+                    "advantage_num_ignore": advantage_batch_stats["num_ignore"],
+                    "advantage_num_condition_dropped": advantage_batch_stats[
+                        "num_condition_dropped"
+                    ],
+                    "advantage_all_ignore_batch": advantage_batch_stats["all_ignore"],
+                }
+            )
+        elif rabc_batch_weights is not None:
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -329,6 +382,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
+    advantage_weights = None
+    if cfg.use_advantage_weighting:
+        advantage_weights = AdvantageWeights(
+            loss_weight_key=cfg.advantage_loss_weight_key,
+            label_key=cfg.advantage_label_key,
+            ignore_label=cfg.advantage_ignore_label,
+            disable_weight_when_condition_dropped=(
+                cfg.advantage_disable_weight_when_condition_dropped
+            ),
+        )
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -423,6 +487,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        if getattr(cfg.policy, "use_advantage_conditioning", False):
+            batch = sample_advantage_condition_mask(
+                batch,
+                label_key=cfg.advantage_label_key,
+                dropout_prob=cfg.advantage_condition_dropout_prob,
+                ignore_label=cfg.advantage_ignore_label,
+            )
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -435,6 +506,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            advantage_weights_provider=advantage_weights,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we

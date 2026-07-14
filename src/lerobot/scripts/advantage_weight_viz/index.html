@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Advantage Weight Inspector</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div><h1>Advantage Weight Inspector</h1><p id="runMeta"></p></div>
+        <label>Mode <select id="valueMode"><option>global</option><option>subtask</option></select></label>
+        <p id="warning" class="warning" hidden></p>
+      </header>
+      <section>
+        <h2>Value / progress bins</h2>
+        <div id="groupStrip" class="groupStrip"></div>
+        <nav><button id="prevGroups">Previous bins</button><span id="groupPage"></span><button id="nextGroups">Next bins</button></nav>
+      </section>
+      <section class="content">
+        <aside>
+          <div class="chunkHeader"><h2 id="groupTitle">Select a bin</h2><select id="sortOrder"><option value="desc">high advantage first</option><option value="asc">low advantage first</option></select></div>
+          <ol id="chunkList" class="chunkList"></ol>
+          <nav><button id="prevChunks">Previous</button><span id="chunkPage"></span><button id="nextChunks">Next</button></nav>
+        </aside>
+        <section class="viewer">
+          <div class="viewerHeader"><div><h2 id="chunkTitle">Select a chunk</h2><p id="chunkDetails"></p></div><label>Camera <select id="cameraSelect"></select></label></div>
+          <div class="imageWrap"><img id="frameImage" alt="Selected action chunk frame" /></div>
+          <div class="playbar"><button id="prevFrame">Prev</button><input id="frameOffset" type="range" min="0" max="0" value="0" /><button id="nextFrame">Next</button></div>
+          <p id="status"></p>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

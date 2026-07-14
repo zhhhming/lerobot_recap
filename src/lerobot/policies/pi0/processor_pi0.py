@@ -23,6 +23,7 @@ from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
+    AdvantageConditionProcessorStep,
     ComplementaryDataProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -139,8 +140,16 @@ def make_pi0_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        Pi0NewLineProcessor(),  # Add newlines before tokenization for PaliGemma
     ]
+    if config.use_advantage_conditioning:
+        input_steps.append(
+            AdvantageConditionProcessorStep(
+                label_key=config.advantage_label_key,
+                condition_format=config.advantage_condition_format,
+                inference_label=config.inference_advantage_label,
+            )
+        )
+    input_steps.append(Pi0NewLineProcessor())  # Add newlines before tokenization for PaliGemma
     if config.predict_subtask:
         input_steps.append(SubtaskTextProcessorStep())
     input_steps.extend(
@@ -150,6 +159,7 @@ def make_pi0_pre_post_processors(
                 max_length=config.tokenizer_max_length,
                 padding_side="right",
                 padding="max_length",
+                truncation_side="left" if config.use_advantage_conditioning else None,
                 tokenize_subtask=config.predict_subtask,
                 subtask_max_length=config.subtask_max_tokens,
             ),

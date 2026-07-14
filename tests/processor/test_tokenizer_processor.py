@@ -42,8 +42,16 @@ from tests.utils import require_package
 class MockTokenizer:
     """Mock tokenizer for testing that mimics transformers tokenizer interface."""
 
+    eos_token_id = 1
+
     def __init__(self, vocab_size: int = 1000):
         self.vocab_size = vocab_size
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        tokens = [((hash(word) % (self.vocab_size - 2)) + 2) for word in text.split()]
+        if add_special_tokens:
+            tokens.append(self.eos_token_id)
+        return tokens
 
     def __call__(
         self,
@@ -325,6 +333,8 @@ def test_get_config_with_tokenizer_name(mock_auto_tokenizer):
         "padding_side": "right",
         "padding": "longest",
         "truncation": False,
+        "subtask_max_length": 48,
+        "tokenize_subtask": False,
     }
 
     assert config == expected
@@ -352,6 +362,8 @@ def test_get_config_with_tokenizer_object():
         "padding_side": "right",
         "padding": "longest",
         "truncation": False,
+        "subtask_max_length": 48,
+        "tokenize_subtask": False,
     }
 
     assert config == expected
@@ -1227,7 +1239,12 @@ def test_get_subtask_empty_list():
 def test_subtask_tokenization_when_present():
     """Test that subtask is tokenized and added to observation when present."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=8)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=8,
+        tokenize_subtask=True,
+        subtask_max_length=8,
+    )
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1247,8 +1264,8 @@ def test_subtask_tokenization_when_present():
     subtask_attention_mask = observation[OBS_LANGUAGE_SUBTASK_ATTENTION_MASK]
     assert isinstance(subtask_tokens, torch.Tensor)
     assert isinstance(subtask_attention_mask, torch.Tensor)
-    assert subtask_tokens.shape == (8,)
-    assert subtask_attention_mask.shape == (8,)
+    assert subtask_tokens.shape == (1, 8)
+    assert subtask_attention_mask.shape == (1, 8)
     assert subtask_attention_mask.dtype == torch.bool
 
 
@@ -1256,7 +1273,7 @@ def test_subtask_tokenization_when_present():
 def test_subtask_tokenization_not_added_when_none():
     """Test that subtask tokens are NOT added to observation when subtask is None."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=8)
+    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=8, tokenize_subtask=True)
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1280,7 +1297,12 @@ def test_subtask_tokenization_not_added_when_none():
 def test_subtask_tokenization_not_added_when_subtask_value_is_none():
     """Test that subtask tokens are NOT added when subtask value is explicitly None."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=8)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=8,
+        tokenize_subtask=True,
+        subtask_max_length=8,
+    )
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1300,7 +1322,12 @@ def test_subtask_tokenization_not_added_when_subtask_value_is_none():
 def test_subtask_tokenization_list_of_strings():
     """Test subtask tokenization with list of strings."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=8)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=8,
+        tokenize_subtask=True,
+        subtask_max_length=8,
+    )
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1326,7 +1353,12 @@ def test_subtask_tokenization_list_of_strings():
 def test_subtask_tokenization_device_cpu():
     """Test that subtask tokens are on CPU when other tensors are on CPU."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=10)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=10,
+        tokenize_subtask=True,
+        subtask_max_length=10,
+    )
 
     # Create transition with CPU tensors
     observation = {OBS_STATE: torch.randn(10)}  # CPU tensor
@@ -1352,7 +1384,12 @@ def test_subtask_tokenization_device_cpu():
 def test_subtask_tokenization_device_cuda():
     """Test that subtask tokens are moved to CUDA when other tensors are on CUDA."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=10)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=10,
+        tokenize_subtask=True,
+        subtask_max_length=10,
+    )
 
     # Create transition with CUDA tensors
     observation = {OBS_STATE: torch.randn(10).cuda()}  # CUDA tensor
@@ -1377,7 +1414,12 @@ def test_subtask_tokenization_device_cuda():
 def test_subtask_tokenization_preserves_other_observation_data():
     """Test that subtask tokenization preserves other observation data."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=10)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=10,
+        tokenize_subtask=True,
+        subtask_max_length=10,
+    )
 
     original_state = torch.tensor([1.0, 2.0, 3.0])
     transition = create_transition(
@@ -1403,7 +1445,12 @@ def test_subtask_tokenization_preserves_other_observation_data():
 def test_subtask_attention_mask_dtype():
     """Test that subtask attention mask has correct dtype (bool)."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=10)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=10,
+        tokenize_subtask=True,
+        subtask_max_length=10,
+    )
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1422,7 +1469,12 @@ def test_subtask_attention_mask_dtype():
 def test_subtask_tokenization_deterministic():
     """Test that subtask tokenization is deterministic for the same input."""
     mock_tokenizer = MockTokenizer(vocab_size=100)
-    processor = TokenizerProcessorStep(tokenizer=mock_tokenizer, max_length=10)
+    processor = TokenizerProcessorStep(
+        tokenizer=mock_tokenizer,
+        max_length=10,
+        tokenize_subtask=True,
+        subtask_max_length=10,
+    )
 
     transition = create_transition(
         observation={"state": torch.tensor([1.0, 2.0])},
@@ -1450,7 +1502,12 @@ def test_subtask_tokenization_integration_with_pipeline(mock_auto_tokenizer):
     mock_tokenizer = MockTokenizer(vocab_size=100)
     mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
 
-    tokenizer_processor = TokenizerProcessorStep(tokenizer_name="test-tokenizer", max_length=6)
+    tokenizer_processor = TokenizerProcessorStep(
+        tokenizer_name="test-tokenizer",
+        max_length=6,
+        tokenize_subtask=True,
+        subtask_max_length=6,
+    )
     robot_processor = DataProcessorPipeline(
         [tokenizer_processor], to_transition=identity_transition, to_output=identity_transition
     )
@@ -1477,7 +1534,7 @@ def test_subtask_tokenization_integration_with_pipeline(mock_auto_tokenizer):
 
     # Check shapes
     assert observation[f"{OBS_LANGUAGE}.tokens"].shape == (6,)
-    assert observation[OBS_LANGUAGE_SUBTASK_TOKENS].shape == (6,)
+    assert observation[OBS_LANGUAGE_SUBTASK_TOKENS].shape == (1, 6)
 
 
 @require_package("transformers")

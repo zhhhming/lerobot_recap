@@ -112,6 +112,13 @@ class PI0Config(PreTrainedConfig):
     subtask_max_decode_tokens: int = 48
     subtask_decode_temperature: float = 0.0
 
+    # Optional advantage-conditioned main task prompt
+    use_advantage_conditioning: bool = False
+    advantage_label_key: str = "advantage_label_global"
+    advantage_loss_weight_key: str = "advantage_loss_weight_global"
+    advantage_condition_format: str = "Advantage: {label}"
+    inference_advantage_label: str = "positive"
+
     # Optimizer settings: see openpi `AdamW``
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -148,6 +155,22 @@ class PI0Config(PreTrainedConfig):
 
         if self.predict_subtask and self.train_expert_only:
             raise ValueError("predict_subtask=True requires train_expert_only=False so the VLM can learn")
+
+        if self.inference_advantage_label not in {"positive", "negative", "none"}:
+            raise ValueError(
+                "inference_advantage_label must be one of positive, negative, or none, "
+                f"got {self.inference_advantage_label!r}"
+            )
+        if not self.advantage_label_key:
+            raise ValueError("advantage_label_key must be non-empty")
+        if not self.advantage_loss_weight_key:
+            raise ValueError("advantage_loss_weight_key must be non-empty")
+        if "{label}" not in self.advantage_condition_format:
+            raise ValueError("advantage_condition_format must include the {label} placeholder")
+        try:
+            self.advantage_condition_format.format(label="positive")
+        except (IndexError, KeyError, ValueError) as exc:
+            raise ValueError("advantage_condition_format must be formattable with {label}") from exc
 
         if self.subtask_max_decode_tokens > self.subtask_max_tokens:
             warnings.warn(

@@ -71,6 +71,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         padding_side: The side to pad on ('left' or 'right').
         padding: The padding strategy ('max_length', 'longest', etc.).
         truncation: Whether to truncate sequences longer than `max_length`.
+        truncation_side: Optional tokenizer truncation-side override for this step.
         input_tokenizer: The internal tokenizer instance, loaded during initialization.
     """
 
@@ -81,6 +82,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
+    truncation_side: str | None = None
     subtask_max_length: int = 48
     tokenize_subtask: bool = False
 
@@ -115,6 +117,10 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
+            )
+        if self.truncation_side not in {None, "left", "right"}:
+            raise ValueError(
+                f"truncation_side must be 'left', 'right', or None, got {self.truncation_side!r}"
             )
 
     def get_task(self, transition: EnvTransition) -> list[str] | None:
@@ -266,14 +272,25 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         Returns:
             A dictionary containing tokenized 'input_ids' and 'attention_mask' as PyTorch tensors.
         """
-        return self.input_tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=self.truncation,
-            padding=self.padding,
-            padding_side=self.padding_side,
-            return_tensors="pt",
-        )
+        missing = object()
+        original_truncation_side = getattr(self.input_tokenizer, "truncation_side", missing)
+        if self.truncation_side is not None:
+            self.input_tokenizer.truncation_side = self.truncation_side
+        try:
+            return self.input_tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=self.truncation,
+                padding=self.padding,
+                padding_side=self.padding_side,
+                return_tensors="pt",
+            )
+        finally:
+            if self.truncation_side is not None:
+                if original_truncation_side is missing:
+                    delattr(self.input_tokenizer, "truncation_side")
+                else:
+                    self.input_tokenizer.truncation_side = original_truncation_side
 
     def _tokenize_subtask(self, text: str | list[str]) -> dict[str, torch.Tensor]:
         texts = [text] if isinstance(text, str) else text
@@ -326,6 +343,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             "subtask_max_length": self.subtask_max_length,
             "tokenize_subtask": self.tokenize_subtask,
         }
+        if self.truncation_side is not None:
+            config["truncation_side"] = self.truncation_side
 
         # Only save tokenizer_name if it was used to create the tokenizer
         if self.tokenizer_name is not None and self.tokenizer is None:

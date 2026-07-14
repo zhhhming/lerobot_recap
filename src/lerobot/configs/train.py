@@ -77,6 +77,14 @@ class TrainPipelineConfig(HubMixin):
     rabc_epsilon: float = 1e-6  # Small constant for numerical stability
     rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
 
+    # Offline group-relative advantage weighting and train-only condition dropout.
+    use_advantage_weighting: bool = False
+    advantage_loss_weight_key: str = "advantage_loss_weight_global"
+    advantage_label_key: str = "advantage_label_global"
+    advantage_condition_dropout_prob: float = 0.1
+    advantage_ignore_label: str = "ignore"
+    advantage_disable_weight_when_condition_dropped: bool = True
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
@@ -112,6 +120,41 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "Policy is not configured. Please specify a pretrained policy with `--policy.path`."
             )
+
+        if not 0.0 <= self.advantage_condition_dropout_prob <= 1.0:
+            raise ValueError(
+                "advantage_condition_dropout_prob must be in [0, 1], got "
+                f"{self.advantage_condition_dropout_prob}"
+            )
+        if not self.advantage_loss_weight_key:
+            raise ValueError("advantage_loss_weight_key must be non-empty")
+        if not self.advantage_label_key:
+            raise ValueError("advantage_label_key must be non-empty")
+        if self.advantage_ignore_label != "ignore":
+            raise ValueError("The first advantage-weighting version only supports ignore label 'ignore'")
+        if self.use_rabc and self.use_advantage_weighting:
+            raise ValueError("use_rabc and use_advantage_weighting cannot be enabled together")
+        if self.use_advantage_weighting and self.policy.type not in {"pi0", "pi05"}:
+            raise ValueError(
+                "use_advantage_weighting currently supports only pi0 and pi05 policies, got "
+                f"{self.policy.type!r}"
+            )
+
+        use_advantage_conditioning = getattr(self.policy, "use_advantage_conditioning", False)
+        if use_advantage_conditioning:
+            policy_label_key = getattr(self.policy, "advantage_label_key", None)
+            if policy_label_key != self.advantage_label_key:
+                raise ValueError(
+                    "Training and policy advantage label keys must match: "
+                    f"{self.advantage_label_key!r} != {policy_label_key!r}"
+                )
+        if self.use_advantage_weighting:
+            policy_weight_key = getattr(self.policy, "advantage_loss_weight_key", None)
+            if policy_weight_key != self.advantage_loss_weight_key:
+                raise ValueError(
+                    "Training and policy advantage loss weight keys must match: "
+                    f"{self.advantage_loss_weight_key!r} != {policy_weight_key!r}"
+                )
 
         if not self.job_name:
             if self.env is None:
