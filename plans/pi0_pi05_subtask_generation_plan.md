@@ -129,7 +129,7 @@ total = fm_loss.mean() + subtask_ce_loss_weight * ce_loss
 # --- Subtask AR generation ---
 predict_subtask: bool = False          # 总开关：训练构造 AR 段 + 推理允许 AR
 subtask_max_tokens: int = 48           # 训练时 AR 段右 pad 定长（含 EOS）
-subtask_ce_loss_weight: float = 0.25   # CE loss 权重（需实验调参，见 §8）
+subtask_ce_loss_weight: float = 0.02   # CE loss 权重（需实验调参，见 §8）
 subtask_dropout_prob: float = 0.2      # 训练时 action expert 看不到 subtask 段的概率
 subtask_generate_at_inference: bool = True   # 部署是否做 AR（False=模式 B）
 subtask_max_decode_tokens: int = 48    # 推理 AR 最大解码步数
@@ -286,7 +286,7 @@ M1/M2 与 M3/M4 可并行；M5 必须在 M4 验收后开始。
 
 ## 10. 风险与开放问题
 
-- **`subtask_ce_loss_weight` 需要实验确定**：CE（初期 ~几个 nat）与 flow-matching MSE（<1）量级不同。默认 0.25 只是起点；分开记录两条 loss 曲线，若 fm loss 退化则下调。
+- **`subtask_ce_loss_weight` 需要实验确定**：CE（初期 ~几个 nat）与 flow-matching MSE（<1）量级不同。当前默认 0.02，让加权 CE 通常低于 flow-matching loss 一个数量级；分开记录两条 loss 曲线，若 subtask 生成太差再上调。
 - **AR 延迟**：gemma-2B 每 token 一次前向，48 token 上限时最坏几百 ms。RTC 是异步推理，理论上可吸收，但要盯 `rtc_last_latency_ms` 是否触发 delay 报警；不可接受时用模式 B 或减小 `subtask_max_decode_tokens`。
 - **标注文本长度**：`subtask_max_tokens=48` 覆盖不了很长的中文/英文标注时会截断（tokenizer 步骤有 warning）；标注时建议 subtask 名保持简短英文短语。
 - **进度档位**：1 位小数 = 10 档；若后续想要 2 位，只改 `SubtaskTextProcessorStep` 的格式串与文档，模型侧无改动（可作为 config 化的后续项）。

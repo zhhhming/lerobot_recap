@@ -1569,11 +1569,13 @@ class PI05Policy(PreTrainedPolicy):
                 device=losses.device,
             )
         ce_loss = ce_loss_per_sample.mean()
+        weighted_ce_loss = self.config.subtask_ce_loss_weight * ce_loss
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
             "fm_loss": fm_loss.item(),
             "ce_loss": ce_loss.item(),
+            "weighted_ce_loss": weighted_ce_loss.item(),
         }
 
         per_sample_fm_loss = losses.mean(dim=(1, 2))
@@ -1594,7 +1596,7 @@ class PI05Policy(PreTrainedPolicy):
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = fm_loss + self.config.subtask_ce_loss_weight * ce_loss
+            loss = fm_loss + weighted_ce_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

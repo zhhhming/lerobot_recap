@@ -18,35 +18,44 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${DATASTORE_ROOT}/lerobot}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-DATASET_REPO_ID="${DATASET_REPO_ID:-ming326/nero_candle_3}"
+DATASET_REPO_ID="${DATASET_REPO_ID:-ming326/strike_match_3_subtask}"
 DATASET_SLUG="${DATASET_REPO_ID##*/}"
 DATASET_ROOT="${DATASET_ROOT:-${HF_LEROBOT_HOME}/${DATASET_REPO_ID}}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 RELATIVE_EXCLUDE_JOINTS="${RELATIVE_EXCLUDE_JOINTS:-['gripper']}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 HF_SNAPSHOT_MAX_WORKERS="${HF_SNAPSHOT_MAX_WORKERS:-1}"
-POLICY_PRETRAINED_PATH="${POLICY_PRETRAINED_PATH:-lerobot/pi0_base}"
+POLICY_TYPE="${POLICY_TYPE:-pi05}"
+if [[ -z "${POLICY_PRETRAINED_PATH:-}" ]]; then
+    if [[ "${POLICY_TYPE}" == "pi05" ]]; then
+        POLICY_PRETRAINED_PATH="lerobot/pi05_base"
+    else
+        POLICY_PRETRAINED_PATH="lerobot/pi0_base"
+    fi
+fi
 TOKENIZER_NAME="${TOKENIZER_NAME:-google/paligemma-3b-pt-224}"
-NUM_GPUS="${NUM_GPUS:-8}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
+export CUDA_VISIBLE_DEVICES
+NUM_GPUS="${NUM_GPUS:-6}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-192}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-}"
 STEPS="${STEPS:-20000}"
 SAVE_FREQ="${SAVE_FREQ:-1000}"
 LOG_FREQ="${LOG_FREQ:-50}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-JOB_NAME="${JOB_NAME:-pi0_${DATASET_SLUG}_relative_bs${GLOBAL_BATCH_SIZE}_${RUN_ID}}"
+JOB_NAME="${JOB_NAME:-${POLICY_TYPE}_${DATASET_SLUG}_relative_bs${GLOBAL_BATCH_SIZE}_${RUN_ID}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${DATASTORE_ROOT}/lerobot_outputs/${JOB_NAME}}"
 POLICY_COMPILE="${POLICY_COMPILE:-true}"
 POLICY_DTYPE="${POLICY_DTYPE:-float32}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
-PREDICT_SUBTASK="${PREDICT_SUBTASK:-false}"
+PREDICT_SUBTASK="${PREDICT_SUBTASK:-true}"
 SUBTASK_MAX_TOKENS="${SUBTASK_MAX_TOKENS:-48}"
-SUBTASK_CE_LOSS_WEIGHT="${SUBTASK_CE_LOSS_WEIGHT:-0.25}"
+SUBTASK_CE_LOSS_WEIGHT="${SUBTASK_CE_LOSS_WEIGHT:-0.02}"
 SUBTASK_DROPOUT_PROB="${SUBTASK_DROPOUT_PROB:-0.2}"
 SUBTASK_GENERATE_AT_INFERENCE="${SUBTASK_GENERATE_AT_INFERENCE:-true}"
-SUBTASK_MAX_DECODE_TOKENS="${SUBTASK_MAX_DECODE_TOKENS:-48}"
+SUBTASK_MAX_DECODE_TOKENS="${SUBTASK_MAX_DECODE_TOKENS:-16}"
 SUBTASK_DECODE_TEMPERATURE="${SUBTASK_DECODE_TEMPERATURE:-0.0}"
 
 usage() {
@@ -61,15 +70,16 @@ Commands:
   download-tokenizer Download/cache ${TOKENIZER_NAME}.
   download-all    Run download, download-policy, and download-tokenizer.
   info            Show LeRobot dataset metadata/features.
-  stats           Recompute stats with relative actions for pi0.
+  stats           Recompute stats with relative actions for pi0/pi05.
   verify-stats    Print the action stats and action feature names from meta/.
   train-command   Print the matching lerobot-train command template.
-  train           Train pi0 with Accelerate on ${NUM_GPUS} GPUs.
+  train           Train ${POLICY_TYPE} with Accelerate on ${NUM_GPUS} GPUs.
 
 Environment overrides:
   DATASTORE_ROOT, HF_HOME, HF_LEROBOT_HOME, DATASET_REPO_ID, DATASET_ROOT,
   CHUNK_SIZE, RELATIVE_EXCLUDE_JOINTS, NUM_WORKERS, HF_SNAPSHOT_MAX_WORKERS, DISABLE_PROXY,
-  POLICY_PRETRAINED_PATH, NUM_GPUS, GLOBAL_BATCH_SIZE, PER_DEVICE_BATCH_SIZE,
+  POLICY_TYPE, POLICY_PRETRAINED_PATH, CUDA_VISIBLE_DEVICES, NUM_GPUS,
+  GLOBAL_BATCH_SIZE, PER_DEVICE_BATCH_SIZE,
   STEPS, SAVE_FREQ, LOG_FREQ, RUN_ID, JOB_NAME, OUTPUT_DIR, POLICY_COMPILE,
   POLICY_DTYPE, MIXED_PRECISION, GRADIENT_CHECKPOINTING, WANDB_ENABLE,
   PREDICT_SUBTASK, SUBTASK_MAX_TOKENS, SUBTASK_CE_LOSS_WEIGHT,
@@ -95,6 +105,8 @@ NUM_WORKERS=${NUM_WORKERS}
 HF_SNAPSHOT_MAX_WORKERS=${HF_SNAPSHOT_MAX_WORKERS}
 POLICY_PRETRAINED_PATH=${POLICY_PRETRAINED_PATH}
 TOKENIZER_NAME=${TOKENIZER_NAME}
+POLICY_TYPE=${POLICY_TYPE}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 NUM_GPUS=${NUM_GPUS}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-auto}
@@ -195,7 +207,7 @@ accelerate launch \\
   -m lerobot.scripts.lerobot_train \\
   --dataset.repo_id=${DATASET_REPO_ID} \\
   --dataset.root=${DATASET_ROOT} \\
-  --policy.type=pi0 \\
+  --policy.type=${POLICY_TYPE} \\
   --policy.pretrained_path=${POLICY_PRETRAINED_PATH} \\
   --policy.use_relative_actions=true \\
   --policy.relative_exclude_joints='["gripper"]' \\
@@ -238,7 +250,7 @@ train_pi0() {
         -m lerobot.scripts.lerobot_train \
         --dataset.repo_id="${DATASET_REPO_ID}" \
         --dataset.root="${DATASET_ROOT}" \
-        --policy.type=pi0 \
+        --policy.type="${POLICY_TYPE}" \
         --policy.pretrained_path="${POLICY_PRETRAINED_PATH}" \
         --policy.use_relative_actions=true \
         --policy.relative_exclude_joints='["gripper"]' \

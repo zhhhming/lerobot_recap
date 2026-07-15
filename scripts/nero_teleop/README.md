@@ -402,7 +402,7 @@ lerobot-push-dataset \
 
 ### nero_candle_pi0_relative.sh — 下载 / 统计 / 训练
 
-针对 "nero_candle" 数据集、**relative action（相对动作）** 的 Pi0 训练一站式脚本，
+针对 `strike_match_3_subtask` 数据集、**relative action（相对动作）** 的 Pi0 / Pi0.5 训练一站式脚本，
 封装了数据/模型下载、统计重算、以及 Accelerate 多卡训练。
 
 ```bash
@@ -416,7 +416,6 @@ lerobot-push-dataset \
 
 # 训练（可用环境变量覆盖默认配置）
 DATASET_REPO_ID=<HF_USER>/<DATASET_REPO_ID> \
-GLOBAL_BATCH_SIZE=256 \
 ./scripts/nero_teleop/nero_candle_pi0_relative.sh train
 ```
 
@@ -437,7 +436,7 @@ GLOBAL_BATCH_SIZE=256 \
 | `stats` | **用相对动作变换重算 action 统计** |
 | `verify-stats` | 显示 `meta/stats.json` 里算好的 action 统计 |
 | `train-command` | 只打印 Accelerate 启动命令模板（不执行） |
-| `train` | 执行完整 Pi0 训练 |
+| `train` | 执行完整 Pi0 / Pi0.5 训练 |
 
 > **为什么 relative 要重算 stats**：使用相对动作（`use_relative_actions=true`）时，
 > action 的数值分布与绝对动作不同，必须用 `stats` 重新计算归一化统计，否则归一化会错。
@@ -447,14 +446,18 @@ GLOBAL_BATCH_SIZE=256 \
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DATASET_REPO_ID` | `example-user/nero_candle`（占位默认） | 数据集 repo，用时覆盖成自己的 |
-| `GLOBAL_BATCH_SIZE` | `128` | 全局 batch（按 GPU 数自动切分到每卡） |
-| `NUM_GPUS` | `8` | GPU 数 |
+| `DATASET_REPO_ID` | `ming326/strike_match_3_subtask` | 数据集 repo |
+| `POLICY_TYPE` | `pi05` | 策略类型；可覆盖为 `pi0` |
+| `POLICY_PRETRAINED_PATH` | `lerobot/pi05_base` | 预训练权重；`POLICY_TYPE=pi0` 时默认用 `lerobot/pi0_base` |
+| `CUDA_VISIBLE_DEVICES` | `0,1,2,3,4,5` | 默认只使用前 6 张卡 |
+| `GLOBAL_BATCH_SIZE` | `192` | 全局 batch（6 卡时每卡 32） |
+| `NUM_GPUS` | `6` | GPU 数 |
+| `POLICY_COMPILE` | `true` | 正式训练默认开启；20 步 smoke 建议覆盖为 `false` |
+| `SUBTASK_MAX_TOKENS` / `SUBTASK_MAX_DECODE_TOKENS` | `16` / `16` | 当前 subtask 标签较短，避免 48 token padding 造成额外计算 |
 | `STEPS` | `20000` | 训练步数 |
 | `SAVE_FREQ` / `LOG_FREQ` | `1000` / `50` | 保存/日志频率 |
-| `POLICY_PRETRAINED_PATH` | `lerobot/pi0_base` | 预训练权重 |
 | `RELATIVE_EXCLUDE_JOINTS` | `['gripper']` | 相对动作里排除的关节（夹爪用绝对值） |
-| `DATASTORE_ROOT` | `${HOME}/lerobot_datastore`（占位默认） | 数据/缓存/输出根目录，用时覆盖成自己的 |
+| `DATASTORE_ROOT` | `/datastore01/hongming` | 数据/缓存/输出根目录，用时覆盖成自己的 |
 | `OUTPUT_DIR` | `${DATASTORE_ROOT}/lerobot_outputs/${JOB_NAME}` | 训练输出目录 |
 
 ---

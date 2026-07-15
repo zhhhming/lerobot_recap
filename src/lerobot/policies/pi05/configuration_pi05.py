@@ -92,7 +92,7 @@ class PI05Config(PreTrainedConfig):
     # Subtask AR generation
     predict_subtask: bool = False
     subtask_max_tokens: int = 48
-    subtask_ce_loss_weight: float = 0.25
+    subtask_ce_loss_weight: float = 0.02
     subtask_dropout_prob: float = 0.2
     subtask_generate_at_inference: bool = True
     subtask_max_decode_tokens: int = 48

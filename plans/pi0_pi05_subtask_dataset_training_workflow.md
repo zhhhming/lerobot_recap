@@ -186,7 +186,9 @@ export http_proxy=http://127.0.0.1:1080
 export https_proxy=http://127.0.0.1:1080
 ```
 
-Download dataset, base policy, and tokenizer:
+Download dataset, base policy, and tokenizer. The helper defaults now target
+`ming326/strike_match_3_subtask`, `POLICY_TYPE=pi05`, `lerobot/pi05_base`, and
+six GPUs:
 
 ```bash
 bash scripts/nero_teleop/nero_candle_pi0_relative.sh download-all
@@ -221,34 +223,72 @@ conda run -n lerobot-main python -m lerobot.scripts.lerobot_push_dataset \
 
 ## 6. Start Training
 
-Recommended first subtask PI0 run:
+Recommended first PI0.5 subtask smoke run on six GPUs:
 
 ```bash
 export DATASTORE_ROOT=/datastore01/hongming
 export DATASET_REPO_ID=ming326/strike_match_3_subtask
 export DATASET_ROOT=/datastore01/hongming/lerobot/${DATASET_REPO_ID}
 
+export POLICY_TYPE=pi05
+export POLICY_PRETRAINED_PATH=lerobot/pi05_base
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export NUM_GPUS=6
+export GLOBAL_BATCH_SIZE=48
+export STEPS=20
+export SAVE_FREQ=20
+export LOG_FREQ=1
+export WANDB_ENABLE=false
+export JOB_NAME=pi05_strike_match_3_subtask_smoke
+
 export PREDICT_SUBTASK=true
-export SUBTASK_MAX_TOKENS=48
-export SUBTASK_CE_LOSS_WEIGHT=0.25
+export SUBTASK_MAX_TOKENS=16
+export SUBTASK_CE_LOSS_WEIGHT=0.02
 export SUBTASK_DROPOUT_PROB=0.2
 export SUBTASK_GENERATE_AT_INFERENCE=true
-export SUBTASK_MAX_DECODE_TOKENS=48
+export SUBTASK_MAX_DECODE_TOKENS=16
 export SUBTASK_DECODE_TEMPERATURE=0.0
 
-export POLICY_PRETRAINED_PATH=lerobot/pi0_base
 export POLICY_DTYPE=float32
 export MIXED_PRECISION=bf16
 export GRADIENT_CHECKPOINTING=true
 export POLICY_COMPILE=false
 
-export NUM_GPUS=8
-export GLOBAL_BATCH_SIZE=128
+bash scripts/nero_teleop/nero_candle_pi0_relative.sh train-command
+bash scripts/nero_teleop/nero_candle_pi0_relative.sh train
+```
+
+If the smoke run is clean, use the full six-GPU run. This keeps the old
+per-device batch size of 32 from the 8-GPU `GLOBAL_BATCH_SIZE=256` setup:
+
+```bash
+export DATASTORE_ROOT=/datastore01/hongming
+export DATASET_REPO_ID=ming326/strike_match_3_subtask
+export DATASET_ROOT=/datastore01/hongming/lerobot/${DATASET_REPO_ID}
+
+export POLICY_TYPE=pi05
+export POLICY_PRETRAINED_PATH=lerobot/pi05_base
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export NUM_GPUS=6
+export GLOBAL_BATCH_SIZE=192
 export STEPS=20000
 export SAVE_FREQ=1000
 export LOG_FREQ=50
 export WANDB_ENABLE=true
-export JOB_NAME=pi0_strike_match_3_subtask_relative_ar
+export JOB_NAME=pi05_strike_match_3_subtask_relative_ar
+
+export PREDICT_SUBTASK=true
+export SUBTASK_MAX_TOKENS=16
+export SUBTASK_CE_LOSS_WEIGHT=0.02
+export SUBTASK_DROPOUT_PROB=0.2
+export SUBTASK_GENERATE_AT_INFERENCE=true
+export SUBTASK_MAX_DECODE_TOKENS=16
+export SUBTASK_DECODE_TEMPERATURE=0.0
+
+export POLICY_DTYPE=float32
+export MIXED_PRECISION=bf16
+export GRADIENT_CHECKPOINTING=true
+export POLICY_COMPILE=true
 
 bash scripts/nero_teleop/nero_candle_pi0_relative.sh train-command
 bash scripts/nero_teleop/nero_candle_pi0_relative.sh train
@@ -256,7 +296,8 @@ bash scripts/nero_teleop/nero_candle_pi0_relative.sh train
 
 Notes:
 
-- Start with `POLICY_COMPILE=false` for the first subtask run. After a clean smoke run, you can try `POLICY_COMPILE=true`.
+- Use `POLICY_COMPILE=false` for short correctness smoke runs, because compile warmup dominates 20-step tests. Use `POLICY_COMPILE=true` for real training.
+- To run PI0 instead of PI0.5, set `POLICY_TYPE=pi0` and `POLICY_PRETRAINED_PATH=lerobot/pi0_base`.
 - `train_expert_only` must stay false when `PREDICT_SUBTASK=true`, because the VLM path needs to learn the subtask CE objective.
 - `freeze_vision_encoder=false` is the current script default. If memory is tight, consider `--policy.freeze_vision_encoder=true` later, but keep the language model trainable.
 
@@ -265,11 +306,11 @@ Notes:
 Training/inference behavior:
 
 - `PREDICT_SUBTASK=true`: enables subtask AR training and inference support.
-- `SUBTASK_MAX_TOKENS=48`: max token length of teacher-forced subtask text during training.
-- `SUBTASK_CE_LOSS_WEIGHT=0.25`: CE loss weight. If flow matching gets worse, try `0.1`; if generated subtask is poor, try `0.5`.
+- `SUBTASK_MAX_TOKENS=16`: max token length of teacher-forced subtask text during training. The current strike-match labels are short, so 16 avoids wasting compute on padded language tokens.
+- `SUBTASK_CE_LOSS_WEIGHT=0.02`: CE loss weight. This keeps the weighted CE term roughly one order of magnitude below flow-matching loss in the current smoke run; raise it only if generated subtasks are poor and flow matching remains healthy.
 - `SUBTASK_DROPOUT_PROB=0.2`: probability that state/action suffix cannot attend to subtask text during training. Higher means more robust no-AR inference, lower means stronger reliance on generated subtask.
 - `SUBTASK_GENERATE_AT_INFERENCE=true`: default deploy mode. Set false to skip AR at inference while using the dropout-trained branch.
-- `SUBTASK_MAX_DECODE_TOKENS=48`: max AR decoding steps at inference.
+- `SUBTASK_MAX_DECODE_TOKENS=16`: max AR decoding steps at inference.
 - `SUBTASK_DECODE_TEMPERATURE=0.0`: greedy decode. Keep `0.0` for robotics deployment.
 
 Training scale:

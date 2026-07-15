@@ -197,6 +197,10 @@ def update_policy(
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     train_metrics.loss = loss.item()
+    if output_dict:
+        for metric_name in ("fm_loss", "ce_loss", "weighted_ce_loss"):
+            if metric_name in output_dict:
+                setattr(train_metrics, metric_name, output_dict[metric_name])
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -454,6 +458,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
+        "fm_loss": AverageMeter("fm", ":.3f"),
+        "ce_loss": AverageMeter("ce", ":.3f"),
+        "weighted_ce_loss": AverageMeter("wce", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
