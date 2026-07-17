@@ -28,6 +28,7 @@ from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     AdvantageConditionProcessorStep,
     DeviceProcessorStep,
+    MemoryConditionProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
@@ -36,6 +37,7 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     SubtaskTextProcessorStep,
+    SubtaskTimeConditionProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
@@ -169,6 +171,10 @@ def make_pi05_pre_post_processors(
                 inference_label=config.inference_advantage_label,
             )
         )
+    if config.use_memory_conditioning:
+        input_steps.append(MemoryConditionProcessorStep())
+    if config.use_subtask_time_conditioning:
+        input_steps.append(SubtaskTimeConditionProcessorStep())
     input_steps.append(
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
@@ -177,14 +183,24 @@ def make_pi05_pre_post_processors(
     )
     if config.predict_subtask:
         input_steps.append(SubtaskTextProcessorStep())
+    tokenizer_budgets = [config.tokenizer_max_length]
+    if config.use_memory_conditioning:
+        tokenizer_budgets.append(config.memory_tokenizer_max_length)
+    if config.use_subtask_time_conditioning:
+        tokenizer_budgets.append(config.subtask_time_tokenizer_max_length)
+    uses_left_truncation = (
+        config.use_advantage_conditioning
+        or config.use_memory_conditioning
+        or config.use_subtask_time_conditioning
+    )
     input_steps.extend(
         [
             TokenizerProcessorStep(
                 tokenizer_name="google/paligemma-3b-pt-224",
-                max_length=config.tokenizer_max_length,
+                max_length=max(tokenizer_budgets),
                 padding_side="right",
                 padding="max_length",
-                truncation_side="left" if config.use_advantage_conditioning else None,
+                truncation_side="left" if uses_left_truncation else None,
                 tokenize_subtask=config.predict_subtask,
                 subtask_max_length=config.subtask_max_tokens,
             ),

@@ -42,7 +42,6 @@ def test_latency_tracker_initialization():
     """Test LatencyTracker initializes correctly."""
     tracker = LatencyTracker(maxlen=50)
     assert len(tracker) == 0
-    assert tracker.max_latency == 0.0
     assert tracker.max() == 0.0
 
 
@@ -100,16 +99,16 @@ def test_add_converts_to_float(tracker):
     assert tracker.max() == 5.0
 
 
-def test_add_updates_max_latency(tracker):
-    """Test that max_latency is updated correctly."""
+def test_add_updates_max(tracker):
+    """Test that the rolling maximum is updated correctly."""
     tracker.add(0.5)
-    assert tracker.max_latency == 0.5
+    assert tracker.max() == 0.5
 
     tracker.add(0.3)
-    assert tracker.max_latency == 0.5  # Should not decrease
+    assert tracker.max() == 0.5  # Should not decrease
 
     tracker.add(0.9)
-    assert tracker.max_latency == 0.9  # Should increase
+    assert tracker.max() == 0.9  # Should increase
 
 
 # ====================== reset() Tests ======================
@@ -124,16 +123,16 @@ def test_reset_clears_values(tracker):
 
     tracker.reset()
     assert len(tracker) == 0
-    assert tracker.max_latency == 0.0
+    assert tracker.max() == 0.0
 
 
-def test_reset_clears_max_latency(tracker):
-    """Test reset() resets max_latency."""
+def test_reset_clears_max(tracker):
+    """Test reset() resets the rolling maximum."""
     tracker.add(1.5)
-    assert tracker.max_latency == 1.5
+    assert tracker.max() == 1.5
 
     tracker.reset()
-    assert tracker.max_latency == 0.0
+    assert tracker.max() == 0.0
 
 
 def test_reset_allows_new_values(tracker):

@@ -45,7 +45,12 @@ from lerobot.utils.advantage_weights import (
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.memory_conditioning import MemoryTrainingMetrics, sample_memory_condition_mask
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.subtask_time_conditioning import (
+    SubtaskTimeTrainingMetrics,
+    sample_subtask_time_condition,
+)
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -207,6 +212,115 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def prepare_training_batch_conditions(
+    batch: dict[str, Any],
+    cfg: TrainPipelineConfig,
+    *,
+    memory_metrics: MemoryTrainingMetrics | None = None,
+    subtask_time_metrics: SubtaskTimeTrainingMetrics | None = None,
+) -> dict[str, Any]:
+    """Sample independent train-only conditions in their canonical order."""
+
+    if getattr(cfg.policy, "use_advantage_conditioning", False):
+        batch = sample_advantage_condition_mask(
+            batch,
+            label_key=cfg.advantage_label_key,
+            dropout_prob=cfg.advantage_condition_dropout_prob,
+            ignore_label=cfg.advantage_ignore_label,
+        )
+    if getattr(cfg.policy, "use_memory_conditioning", False):
+        batch = sample_memory_condition_mask(
+            batch,
+            dropout_prob=cfg.memory_dropout_prob,
+        )
+        if memory_metrics is not None:
+            memory_metrics.update(batch)
+    if getattr(cfg.policy, "use_subtask_time_conditioning", False):
+        batch = sample_subtask_time_condition(
+            batch,
+            noise_ratio=cfg.subtask_time_noise_ratio,
+            noise_max_seconds=cfg.subtask_time_noise_max_seconds,
+            dropout_prob=cfg.subtask_time_dropout_prob,
+        )
+        if subtask_time_metrics is not None:
+            subtask_time_metrics.update(batch)
+    return batch
+
+
+def make_train_pre_post_processors(
+    *,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    dataset: Any,
+    device: torch.device,
+):
+    """Create the processors selected by the offline-train entrypoint.
+
+    Non-resume prompt-conditioning training can be a structural processor
+    override: policy weights still load from ``cfg.policy.pretrained_path``,
+    while processors are rebuilt from the current policy config so an older
+    checkpoint cannot silently omit a required step. Resume keeps loading the
+    saved processors.
+    """
+
+    processor_pretrained_path = cfg.policy.pretrained_path
+    structural_prompt_fields = [
+        field_name
+        for field_name in ("use_memory_conditioning", "use_subtask_time_conditioning")
+        if getattr(cfg.policy, field_name, False)
+    ]
+    if structural_prompt_fields and processor_pretrained_path is not None and not cfg.resume:
+        logging.info(
+            "structural processor config change (%s); rebuilding train pre/post processors "
+            "from the current policy config and dataset stats.",
+            ", ".join(structural_prompt_fields),
+        )
+        processor_pretrained_path = None
+    if (
+        getattr(cfg.policy, "use_relative_actions", False)
+        and processor_pretrained_path is not None
+        and not cfg.resume
+    ):
+        logging.warning(
+            "use_relative_actions=true with pretrained processors can skip relative transforms if "
+            "the checkpoint processors do not define them. Building processors from current policy config."
+        )
+        processor_pretrained_path = None
+
+    processor_kwargs = {}
+    postprocessor_kwargs = {}
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+        processor_kwargs["dataset_stats"] = dataset.meta.stats
+
+    if cfg.policy.type == "sarm":
+        processor_kwargs["dataset_meta"] = dataset.meta
+
+    if processor_pretrained_path is not None:
+        processor_kwargs["preprocessor_overrides"] = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": dataset.meta.stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        postprocessor_kwargs["postprocessor_overrides"] = {
+            "unnormalizer_processor": {
+                "stats": dataset.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+
+    return make_pre_post_processors(
+        policy_cfg=cfg.policy,
+        pretrained_path=processor_pretrained_path,
+        **processor_kwargs,
+        **postprocessor_kwargs,
+    )
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -309,54 +423,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
-    processor_pretrained_path = cfg.policy.pretrained_path
-    if (
-        getattr(cfg.policy, "use_relative_actions", False)
-        and processor_pretrained_path is not None
-        and not cfg.resume
-    ):
-        logging.warning(
-            "use_relative_actions=true with pretrained processors can skip relative transforms if "
-            "the checkpoint processors do not define them. Building processors from current policy config."
-        )
-        processor_pretrained_path = None
-
-    # Create processors - only provide dataset_stats if not resuming from saved processors
-    processor_kwargs = {}
-    postprocessor_kwargs = {}
-    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
-        # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
-
-    # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
-        processor_kwargs["dataset_meta"] = dataset.meta
-
-    if processor_pretrained_path is not None:
-        processor_kwargs["preprocessor_overrides"] = {
-            "device_processor": {"device": device.type},
-            "normalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        pretrained_path=processor_pretrained_path,
-        **processor_kwargs,
-        **postprocessor_kwargs,
+    preprocessor, postprocessor = make_train_pre_post_processors(
+        cfg=cfg,
+        policy=policy,
+        dataset=dataset,
+        device=device,
     )
 
     if is_main_process:
@@ -477,6 +548,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         initial_step=step,
         accelerator=accelerator,
     )
+    memory_metrics = (
+        MemoryTrainingMetrics()
+        if getattr(cfg.policy, "use_memory_conditioning", False)
+        else None
+    )
+    subtask_time_metrics = (
+        SubtaskTimeTrainingMetrics()
+        if getattr(cfg.policy, "use_subtask_time_conditioning", False)
+        else None
+    )
 
     if is_main_process:
         progbar = tqdm(
@@ -494,13 +575,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        if getattr(cfg.policy, "use_advantage_conditioning", False):
-            batch = sample_advantage_condition_mask(
-                batch,
-                label_key=cfg.advantage_label_key,
-                dropout_prob=cfg.advantage_condition_dropout_prob,
-                ignore_label=cfg.advantage_ignore_label,
-            )
+        batch = prepare_training_batch_conditions(
+            batch,
+            cfg,
+            memory_metrics=memory_metrics,
+            subtask_time_metrics=subtask_time_metrics,
+        )
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -528,10 +608,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            memory_log = memory_metrics.to_dict() if memory_metrics is not None else {}
+            subtask_time_log = (
+                subtask_time_metrics.to_dict() if subtask_time_metrics is not None else {}
+            )
+            if memory_log:
+                logging.info("Memory training metrics: %s", pformat(memory_log))
+            if subtask_time_log:
+                logging.info("Subtask-time training metrics: %s", pformat(subtask_time_log))
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                wandb_log_dict.update(memory_log)
+                wandb_log_dict.update(subtask_time_log)
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
@@ -544,6 +634,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+            if memory_metrics is not None:
+                memory_metrics.reset()
+            if subtask_time_metrics is not None:
+                subtask_time_metrics.reset()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

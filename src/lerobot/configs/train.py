@@ -13,6 +13,8 @@
 # limitations under the License.
 import builtins
 import datetime as dt
+import math
+import numbers
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +87,16 @@ class TrainPipelineConfig(HubMixin):
     advantage_ignore_label: str = "ignore"
     advantage_disable_weight_when_condition_dropped: bool = True
 
+    # Dynamic previous-subtask history and train-only memory condition dropout.
+    memory_lookback_min_frames: int = 1
+    memory_lookback_max_frames: int = 12
+    memory_dropout_prob: float = 0.2
+
+    # Current-subtask elapsed-time noise and independent condition dropout.
+    subtask_time_noise_ratio: float = 0.4
+    subtask_time_noise_max_seconds: float = 5.0
+    subtask_time_dropout_prob: float = 0.2
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
@@ -120,6 +132,74 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "Policy is not configured. Please specify a pretrained policy with `--policy.path`."
             )
+
+        if (
+            isinstance(self.memory_lookback_min_frames, bool)
+            or isinstance(self.memory_lookback_max_frames, bool)
+            or not isinstance(self.memory_lookback_min_frames, numbers.Integral)
+            or not isinstance(self.memory_lookback_max_frames, numbers.Integral)
+            or self.memory_lookback_min_frames < 1
+            or self.memory_lookback_min_frames > self.memory_lookback_max_frames
+        ):
+            raise ValueError(
+                "memory lookback must satisfy 1 <= memory_lookback_min_frames <= "
+                "memory_lookback_max_frames, got "
+                f"{self.memory_lookback_min_frames} and {self.memory_lookback_max_frames}"
+            )
+        if not 0.0 <= self.memory_dropout_prob <= 1.0:
+            raise ValueError(
+                f"memory_dropout_prob must be in [0, 1], got {self.memory_dropout_prob}"
+            )
+        use_memory_conditioning = bool(
+            getattr(self.policy, "use_memory_conditioning", False)
+        )
+        if use_memory_conditioning:
+            if self.policy.type not in {"pi0", "pi05"}:
+                raise ValueError(
+                    "Memory conditioning currently supports only pi0 and pi05 policies, "
+                    f"got {self.policy.type!r}"
+                )
+            if self.dataset.streaming:
+                raise ValueError(
+                    "Memory conditioning requires a non-streaming dataset; "
+                    "set --dataset.streaming=false."
+                )
+
+        for field_name in ("subtask_time_noise_ratio", "subtask_time_noise_max_seconds"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or value < 0.0
+            ):
+                raise ValueError(f"{field_name} must be finite and >= 0, got {value!r}")
+        if (
+            isinstance(self.subtask_time_dropout_prob, bool)
+            or not isinstance(self.subtask_time_dropout_prob, numbers.Real)
+            or not math.isfinite(float(self.subtask_time_dropout_prob))
+            or not 0.0 <= self.subtask_time_dropout_prob <= 1.0
+        ):
+            raise ValueError(
+                "subtask_time_dropout_prob must be finite and in [0, 1], got "
+                f"{self.subtask_time_dropout_prob!r}"
+            )
+        use_subtask_time_conditioning = bool(
+            getattr(self.policy, "use_subtask_time_conditioning", False)
+        )
+        if use_subtask_time_conditioning:
+            if self.policy.type not in {"pi0", "pi05"}:
+                raise ValueError(
+                    "Subtask time conditioning currently supports only pi0 and pi05 policies, "
+                    f"got {self.policy.type!r}"
+                )
+            if not bool(getattr(self.policy, "predict_subtask", False)):
+                raise ValueError("Subtask time conditioning requires predict_subtask=True.")
+            if self.dataset.streaming:
+                raise ValueError(
+                    "Subtask time conditioning requires a non-streaming dataset; "
+                    "set --dataset.streaming=false."
+                )
 
         if not 0.0 <= self.advantage_condition_dropout_prob <= 1.0:
             raise ValueError(

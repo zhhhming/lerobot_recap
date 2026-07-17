@@ -1378,6 +1378,9 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self.last_subtask_text = ""
+        self._last_logged_subtask_text = None
+        self.model._last_subtask_tokens = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1505,7 +1508,7 @@ class PI05Policy(PreTrainedPolicy):
                 self.last_subtask_text = decoded[0] if len(decoded) == 1 else decoded
                 log_text = self.last_subtask_text if isinstance(self.last_subtask_text, str) else str(decoded)
                 if log_text != self._last_logged_subtask_text:
-                    logging.info("[subtask] %s", log_text)
+                    logging.debug("[subtask] %s", log_text)
                     self._last_logged_subtask_text = log_text
 
         # Unpad actions to actual action dimension

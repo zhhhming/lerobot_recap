@@ -41,6 +41,7 @@ import ssl
 from pathlib import Path
 
 import httpx
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import set_client_factory
 from huggingface_hub.utils import HfHubHTTPError
 from huggingface_hub.utils._http import hf_request_event_hook
@@ -53,6 +54,8 @@ from lerobot.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
 LARGE_UPLOAD_CACHE_MARKER = "lerobot_push_dataset_upload_target.txt"
+HUB_CONNECT_TIMEOUT_SECONDS = 10.0
+HUB_IO_TIMEOUT_SECONDS = 60.0
 
 
 def _resolve_dataset_root(repo_id: str, root: str | Path | None) -> Path:
@@ -86,6 +89,17 @@ def _configure_proxy(proxy: str | None) -> None:
     logger.info("Using proxy %s", normalized_proxy)
 
 
+def _configure_xet(disable_xet: bool) -> None:
+    if not disable_xet:
+        return
+
+    # huggingface_hub reads this environment variable into a module constant at
+    # import time. Update both so the CLI flag also works after LeRobot imports.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    hf_constants.HF_HUB_DISABLE_XET = True
+    logger.info("Disabled Hugging Face Xet transfers; using standard HTTP/LFS uploads")
+
+
 def _configure_tls(max_tls_1_2: bool) -> None:
     if not max_tls_1_2:
         return
@@ -97,7 +111,10 @@ def _configure_tls(max_tls_1_2: bool) -> None:
         return httpx.Client(
             event_hooks={"request": [hf_request_event_hook]},
             follow_redirects=True,
-            timeout=None,
+            timeout=httpx.Timeout(
+                HUB_IO_TIMEOUT_SECONDS,
+                connect=HUB_CONNECT_TIMEOUT_SECONDS,
+            ),
             verify=ssl_context,
         )
 
@@ -128,31 +145,29 @@ def _large_upload_target(repo_id: str, branch: str | None) -> str:
 
 
 def _prepare_large_upload_cache(root: Path, repo_id: str, branch: str | None) -> None:
-    """Avoid reusing upload_large_folder state across different Hub repos.
+    """Prepare resumable upload state for exactly one Hub repo target.
 
     huggingface_hub stores upload state under the local dataset directory and
     documents that the same folder must not be uploaded to multiple repos unless
     this cache is removed first. Reusing it can mark files as already committed
-    and produce an incomplete target repository.
+    and produce an incomplete target repository. The target marker must be
+    written before uploading so an interrupted upload can resume on the next run.
     """
     upload_cache = _large_upload_cache_dir(root)
-    if not upload_cache.exists():
-        return
-
     target = _large_upload_target(repo_id, branch)
     marker = _large_upload_cache_marker(root)
-    previous_target = marker.read_text().strip() if marker.exists() else None
+    if upload_cache.exists():
+        previous_target = marker.read_text().strip() if marker.exists() else None
+        if previous_target != target:
+            logger.warning(
+                "Removing stale Hugging Face large-upload cache at '%s' before uploading to %s. "
+                "This prevents reusing upload state from a different dataset repo.",
+                upload_cache,
+                target,
+            )
+            shutil.rmtree(upload_cache)
 
-    if previous_target == target:
-        return
-
-    logger.warning(
-        "Removing stale Hugging Face large-upload cache at '%s' before uploading to %s. "
-        "This prevents reusing upload state from a different dataset repo.",
-        upload_cache,
-        target,
-    )
-    shutil.rmtree(upload_cache)
+    _mark_large_upload_cache_target(root, repo_id, branch)
 
 
 def _mark_large_upload_cache_target(root: Path, repo_id: str, branch: str | None) -> None:
@@ -175,6 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tags", default=None, help="Comma-separated dataset tags.")
     parser.add_argument("--license", default="apache-2.0", help="Dataset card license. Defaults to apache-2.0.")
     parser.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://127.0.0.1:1080.")
+    parser.add_argument(
+        "--disable-xet",
+        action="store_true",
+        help="Disable Hugging Face Xet transfers and use standard HTTP/LFS uploads.",
+    )
     parser.add_argument(
         "--tls-max-1-2",
         action="store_true",
@@ -225,6 +245,7 @@ def main() -> None:
     args = build_parser().parse_args()
 
     _configure_proxy(args.proxy)
+    _configure_xet(args.disable_xet)
     _configure_tls(args.tls_max_1_2)
 
     root = _resolve_dataset_root(args.repo_id, args.root)
@@ -265,9 +286,6 @@ def main() -> None:
     except HfHubHTTPError:
         logger.exception("Hub upload failed. Check your Hugging Face token, repo permissions, and network/proxy.")
         raise
-    if args.upload_large_folder:
-        _mark_large_upload_cache_target(root, args.repo_id, args.branch)
-
     logger.info("Uploaded dataset to https://huggingface.co/datasets/%s", args.repo_id)
 
 

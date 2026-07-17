@@ -8,12 +8,18 @@ import logging
 import math
 import time
 import traceback
+from collections.abc import Callable
 from threading import Event, Lock, Thread
 from typing import Any
 
 import torch
 
 from lerobot.datasets.feature_utils import build_dataset_frame
+from lerobot.datasets.subtask_timing import SubtaskSequenceContract
+from lerobot.inference_engines.subtask_time_tracker import (
+    SubtaskTimeTracker,
+    SubtaskTimeTrackerSnapshot,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -45,6 +51,9 @@ class RTCInferenceEngine(InferenceEngine):
         device: str | None,
         rtc_queue_threshold: int = 40,
         shutdown_event: Event | None = None,
+        subtask_sequence_contract: SubtaskSequenceContract | None = None,
+        subtask_time_enabled: bool = False,
+        subtask_time_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -74,6 +83,40 @@ class RTCInferenceEngine(InferenceEngine):
         self._last_timing_ms: dict[str, float] = {}
         self._inference_count = 0
         self._phase_info: tuple[str, float] = ("init", time.perf_counter())
+
+        policy_config = getattr(policy, "config", None)
+        self._memory_conditioning_enabled = bool(
+            getattr(policy_config, "use_memory_conditioning", False)
+        )
+        self._memory_updates_enabled = self._memory_conditioning_enabled and bool(
+            getattr(policy_config, "subtask_generate_at_inference", True)
+        )
+        self._memory_text_for_next_inference = ""
+        self._last_memory_input_text = ""
+        self._last_subtask_output_text = ""
+        self._memory_source_inference_id: int | None = None
+
+        self._subtask_time_enabled = bool(subtask_time_enabled)
+        if self._subtask_time_enabled and subtask_sequence_contract is None:
+            raise ValueError(
+                "subtask_sequence_contract is required when subtask_time_enabled=True"
+            )
+        self._subtask_time_clock = subtask_time_clock
+        self._subtask_time_tracker = (
+            SubtaskTimeTracker(subtask_sequence_contract, clock=subtask_time_clock)
+            if self._subtask_time_enabled and subtask_sequence_contract is not None
+            else None
+        )
+        self._subtask_time_updates_enabled = self._subtask_time_enabled and bool(
+            getattr(policy_config, "subtask_generate_at_inference", True)
+        )
+        self._last_subtask_time_input_seconds: float | None = None
+        self._subtask_time_capped_indices: set[int] = set()
+        if self._subtask_time_enabled and not self._subtask_time_updates_enabled:
+            logger.warning(
+                "RTC subtask elapsed-time conditioning is enabled but "
+                "subtask_generate_at_inference=False; elapsed time will remain invalid."
+            )
 
         self._relative_step = next(
             (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
@@ -105,18 +148,56 @@ class RTCInferenceEngine(InferenceEngine):
         self._rtc_thread = None
 
     def pause(self) -> None:
+        """Stop inference without changing semantic or runtime state.
+
+        This low-level compatibility API is intentionally distinct from
+        :meth:`soft_pause`, which is the safe deploy-session operation.
+        """
         self._policy_active.clear()
 
     def resume(self) -> None:
-        self._policy_active.set()
+        with self._state_lock:
+            if self._subtask_time_tracker is not None:
+                self._subtask_time_tracker.resume()
+            self._policy_active.set()
 
-    def reset(self) -> None:
+    def soft_pause(self) -> None:
+        """Safely pause deployment while freezing confirmed subtask time."""
+        self._policy_active.clear()
         with self._state_lock:
             self._reset_version += 1
+            self._clear_memory_state_locked()
+            if self._subtask_time_tracker is not None:
+                self._subtask_time_tracker.pause()
             if self._action_queue is not None:
                 self._action_queue.clear()
-        with self._obs_lock:
-            self._obs_holder["obs"] = None
+            with self._obs_lock:
+                self._obs_holder["obs"] = None
+        self._reset_policy_runtime()
+        logger.info("RTC soft pause: runtime cleared and subtask elapsed time frozen.")
+
+    def full_reset(self) -> None:
+        """Stop inference and clear all runtime and semantic session state."""
+        self._policy_active.clear()
+        self._reset_runtime_state()
+        logger.info("RTC full reset: runtime and subtask elapsed-time state cleared.")
+
+    def reset(self) -> None:
+        """Compatibility reset that preserves the caller-controlled active flag."""
+        self._reset_runtime_state()
+
+    def _reset_runtime_state(self) -> None:
+        with self._state_lock:
+            self._reset_version += 1
+            self._clear_memory_state_locked()
+            self._clear_subtask_time_state_locked()
+            if self._action_queue is not None:
+                self._action_queue.clear()
+            with self._obs_lock:
+                self._obs_holder["obs"] = None
+        self._reset_policy_runtime()
+
+    def _reset_policy_runtime(self) -> None:
         with self._inference_lock:
             self._policy.reset()
             self._preprocessor.reset()
@@ -134,9 +215,14 @@ class RTCInferenceEngine(InferenceEngine):
 
     def debug_snapshot(self) -> dict[str, Any]:
         queue = self._action_queue
-        phase_name, phase_start = self._phase_info
-        phase_duration_ms = (time.perf_counter() - phase_start) * 1e3
         with self._state_lock:
+            phase_name, phase_start = self._phase_info
+            phase_duration_ms = (time.perf_counter() - phase_start) * 1e3
+            subtask_time = (
+                self._subtask_time_tracker.snapshot()
+                if self._subtask_time_tracker is not None
+                else None
+            )
             return {
                 "queue_size": queue.qsize() if queue is not None else 0,
                 "last_latency_s": self._last_latency_s,
@@ -148,7 +234,72 @@ class RTCInferenceEngine(InferenceEngine):
                 "failed": self.failed,
                 "current_phase": phase_name,
                 "current_phase_duration_ms": round(phase_duration_ms, 1),
+                "memory_text_for_next_inference": self._memory_text_for_next_inference,
+                "last_memory_input_text": self._last_memory_input_text,
+                "last_subtask_output_text": self._last_subtask_output_text,
+                "memory_source_inference_id": self._memory_source_inference_id,
+                **self._subtask_time_debug_fields(subtask_time),
             }
+
+    def _clear_memory_state_locked(self) -> None:
+        """Clear semantic inference state while the caller holds ``_state_lock``."""
+        self._memory_text_for_next_inference = ""
+        self._last_memory_input_text = ""
+        self._last_subtask_output_text = ""
+        self._memory_source_inference_id = None
+
+    def _clear_subtask_time_state_locked(self) -> None:
+        """Clear elapsed-time semantic state while holding ``_state_lock``."""
+        if self._subtask_time_tracker is not None:
+            self._subtask_time_tracker.full_reset()
+        self._last_subtask_time_input_seconds = None
+        self._subtask_time_capped_indices.clear()
+
+    def _subtask_time_debug_fields(
+        self, snapshot: SubtaskTimeTrackerSnapshot | None
+    ) -> dict[str, Any]:
+        if snapshot is None:
+            return {
+                "subtask_time_enabled": False,
+                "subtask_time_current_index": None,
+                "subtask_time_current_name": None,
+                "subtask_time_raw_elapsed_seconds": 0.0,
+                "subtask_time_effective_seconds": 0.0,
+                "subtask_time_cap_seconds": None,
+                "subtask_time_valid": False,
+                "subtask_time_running": False,
+                "subtask_time_paused": False,
+                "subtask_time_last_transition": "disabled",
+                "subtask_time_last_rejected_output": "",
+                "subtask_time_last_rejection_reason": "",
+                "subtask_time_last_input_seconds": None,
+            }
+        return {
+            "subtask_time_enabled": True,
+            "subtask_time_current_index": snapshot.current_index,
+            "subtask_time_current_name": snapshot.current_name,
+            "subtask_time_raw_elapsed_seconds": snapshot.raw_elapsed_seconds,
+            "subtask_time_effective_seconds": snapshot.effective_elapsed_seconds,
+            "subtask_time_cap_seconds": snapshot.cap_seconds,
+            "subtask_time_valid": snapshot.time_valid,
+            "subtask_time_running": snapshot.running,
+            "subtask_time_paused": snapshot.paused,
+            "subtask_time_last_transition": snapshot.last_transition_reason,
+            "subtask_time_last_rejected_output": snapshot.last_rejected_output,
+            "subtask_time_last_rejection_reason": snapshot.last_rejection_reason,
+            "subtask_time_last_input_seconds": self._last_subtask_time_input_seconds,
+        }
+
+    def _subtask_output_candidate(self) -> str:
+        output = getattr(self._policy, "last_subtask_text", "")
+        if output is None:
+            return ""
+        if not isinstance(output, str):
+            raise ValueError(
+                "RTC subtask output must be a string from deployment batch size 1; "
+                f"got {type(output).__name__}"
+            )
+        return " ".join(output.split())
 
     def _rtc_loop(self) -> None:
         try:
@@ -163,6 +314,14 @@ class RTCInferenceEngine(InferenceEngine):
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
+                with self._state_lock:
+                    reset_version = self._reset_version
+                    memory_input_text = (
+                        self._memory_text_for_next_inference
+                        if self._memory_updates_enabled
+                        else ""
+                    )
+
                 queue = self._action_queue
                 with self._obs_lock:
                     obs = self._obs_holder.get("obs")
@@ -176,12 +335,51 @@ class RTCInferenceEngine(InferenceEngine):
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
+                subtask_time_snapshot: SubtaskTimeTrackerSnapshot | None = None
+                with self._state_lock:
+                    if (
+                        self._shutdown_event.is_set()
+                        or not self._policy_active.is_set()
+                        or reset_version != self._reset_version
+                    ):
+                        self._phase_info = ("idle_reset", time.perf_counter())
+                        continue
+                    if self._subtask_time_tracker is not None:
+                        inference_start_monotonic = self._subtask_time_clock()
+                        subtask_time_snapshot = self._subtask_time_tracker.snapshot(
+                            at_monotonic=inference_start_monotonic
+                        )
+                        if (
+                            subtask_time_snapshot.time_valid
+                            and subtask_time_snapshot.current_index is not None
+                            and subtask_time_snapshot.cap_seconds is not None
+                            and subtask_time_snapshot.raw_elapsed_seconds
+                            >= subtask_time_snapshot.cap_seconds
+                            and subtask_time_snapshot.current_index
+                            not in self._subtask_time_capped_indices
+                        ):
+                            self._subtask_time_capped_indices.add(
+                                subtask_time_snapshot.current_index
+                            )
+                            logger.warning(
+                                "Subtask elapsed time reached deployment cap: index=%d "
+                                "subtask=%s raw=%.1fs cap=%.1fs",
+                                subtask_time_snapshot.current_index,
+                                subtask_time_snapshot.current_name,
+                                subtask_time_snapshot.raw_elapsed_seconds,
+                                subtask_time_snapshot.cap_seconds,
+                            )
+
+                subtask_time_input_seconds = (
+                    subtask_time_snapshot.effective_elapsed_seconds
+                    if subtask_time_snapshot is not None and subtask_time_snapshot.time_valid
+                    else None
+                )
+
                 try:
                     current_time = time.perf_counter()
                     idx_before = queue.get_action_index()
                     prev_actions = None
-                    with self._state_lock:
-                        reset_version = self._reset_version
 
                     latency = latency_tracker.max()
                     delay = math.ceil(latency / time_per_chunk) if latency else 0
@@ -202,6 +400,18 @@ class RTCInferenceEngine(InferenceEngine):
                             self._robot.robot_type,
                         )
                         obs_batch["task"] = [self._task]
+                        if self._memory_conditioning_enabled:
+                            memory_valid = bool(memory_input_text)
+                            obs_batch["memory_text"] = [memory_input_text]
+                            obs_batch["memory_valid"] = [memory_valid]
+                            obs_batch["memory_condition_kept"] = [memory_valid]
+                        if self._subtask_time_enabled:
+                            time_valid = subtask_time_input_seconds is not None
+                            obs_batch["subtask_time_seconds"] = [
+                                subtask_time_input_seconds if time_valid else 0.0
+                            ]
+                            obs_batch["subtask_time_valid"] = [time_valid]
+                            obs_batch["subtask_time_condition_kept"] = [time_valid]
                         timings["prepare_obs"] = time.perf_counter() - stage_start
 
                         stage_start = time.perf_counter()
@@ -233,6 +443,13 @@ class RTCInferenceEngine(InferenceEngine):
                             inference_delay=delay,
                             prev_chunk_left_over=prev_actions,
                         )
+                        if actions.ndim == 0 or actions.shape[0] != 1:
+                            batch_size = 0 if actions.ndim == 0 else actions.shape[0]
+                            raise ValueError(
+                                "RTC inference supports deployment batch size 1; "
+                                f"got batch size {batch_size}"
+                            )
+                        subtask_output_candidate = self._subtask_output_candidate()
                         timings["predict"] = time.perf_counter() - stage_start
 
                         stage_start = time.perf_counter()
@@ -255,13 +472,46 @@ class RTCInferenceEngine(InferenceEngine):
                         stage_start = time.perf_counter()
                         self._phase_info = ("merge", stage_start)
                         queue.merge(original, processed, real_delay, idx_before)
+                        if (
+                            self._subtask_time_tracker is not None
+                            and self._subtask_time_updates_enabled
+                        ):
+                            committed_time = self._subtask_time_tracker.commit_subtask_output(
+                                subtask_output_candidate
+                            )
+                            if committed_time.last_transition_reason in ("started", "advanced"):
+                                logger.info(
+                                    "Subtask elapsed-time tracker %s: index=%d subtask=%s",
+                                    committed_time.last_transition_reason,
+                                    committed_time.current_index,
+                                    committed_time.current_name,
+                                )
+                            elif committed_time.last_transition_reason.startswith("rejected_"):
+                                logger.debug(
+                                    "Subtask elapsed-time tracker rejected output: transition=%s "
+                                    "reason=%s output=%r",
+                                    committed_time.last_transition_reason,
+                                    committed_time.last_rejection_reason,
+                                    committed_time.last_rejected_output,
+                                )
                         timings["merge"] = time.perf_counter() - stage_start
                         timings["total"] = new_latency
                         self._last_latency_s = new_latency
                         self._last_real_delay = real_delay
                         self._last_queue_size = queue.qsize()
                         self._last_timing_ms = {key: value * 1e3 for key, value in timings.items()}
-                        self._inference_count += 1
+                        committed_inference_id = self._inference_count + 1
+                        self._last_memory_input_text = memory_input_text
+                        self._last_subtask_output_text = subtask_output_candidate
+                        next_memory = (
+                            subtask_output_candidate if self._memory_updates_enabled else ""
+                        )
+                        self._memory_text_for_next_inference = next_memory
+                        self._memory_source_inference_id = (
+                            committed_inference_id if next_memory else None
+                        )
+                        self._last_subtask_time_input_seconds = subtask_time_input_seconds
+                        self._inference_count = committed_inference_id
                     self._phase_info = ("between_inferences", time.perf_counter())
                     consecutive_errors = 0
                 except Exception as e:

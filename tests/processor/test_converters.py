@@ -291,6 +291,51 @@ def test_batch_to_transition_without_index_fields():
     assert "task_index" not in comp_data
 
 
+def test_batch_to_transition_routes_all_memory_fields():
+    batch = {
+        OBS_STATE: torch.randn(2, 7),
+        "task": ["a", "b"],
+        "memory_subtask": ["old-a", "old-b"],
+        "memory_subtask_progress": torch.tensor([[0.2], [0.7]]),
+        "memory_valid": torch.tensor([True, False]),
+        "memory_frame_offset": torch.tensor([4, 9]),
+        "memory_text": ["prediction-a", "prediction-b"],
+        "memory_condition_kept": torch.tensor([True, False]),
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    for key, value in batch.items():
+        if not key.startswith("memory_"):
+            continue
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(comp_data[key], value)
+        else:
+            assert comp_data[key] == value
+
+
+def test_batch_to_transition_routes_all_subtask_time_fields():
+    batch = {
+        "task": ["a", "b"],
+        "subtask_elapsed_seconds": torch.tensor([0.0, 4.0]),
+        "subtask_time_valid": torch.tensor([True, True]),
+        "subtask_segment_index": torch.tensor([0, 1]),
+        "subtask_time_seconds": torch.tensor([0.0, 3.5]),
+        "subtask_time_condition_kept": torch.tensor([True, False]),
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    for key, value in batch.items():
+        assert key in comp_data
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(comp_data[key], value)
+        else:
+            assert comp_data[key] == value
+
+
 def test_transition_to_batch_without_index_fields():
     """Test that conversion works without index and task_index fields."""
 

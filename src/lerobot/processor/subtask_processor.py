@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 
 import logging
+import math
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 import torch
@@ -11,6 +13,22 @@ from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from .pipeline import ComplementaryDataProcessorStep, ProcessorStepRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def format_subtask_output(subtask: Any, progress: Any) -> str:
+    """Format one subtask/progress pair without an outer prefix or trailing newline."""
+    if not isinstance(subtask, str) or not subtask.strip():
+        return ""
+
+    if isinstance(progress, bool) or not isinstance(progress, Real):
+        raise ValueError(f"subtask progress must be numeric, got {progress!r}")
+    progress_float = float(progress)
+    if not math.isfinite(progress_float):
+        raise ValueError(f"subtask progress must be finite, got {progress!r}")
+
+    progress_float = round(progress_float, 1)
+    progress_float = min(1.0, max(0.0, progress_float))
+    return f"Subtask: {subtask.strip()}; Progress: {progress_float:.1f}"
 
 
 def _to_list(value: Any) -> list[Any]:
@@ -57,13 +75,8 @@ class SubtaskTextProcessorStep(ComplementaryDataProcessorStep):
 
         formatted: list[str] = []
         for subtask, progress in zip(subtasks, progresses, strict=True):
-            if not isinstance(subtask, str) or not subtask.strip():
-                formatted.append("")
-                continue
-
-            progress_float = round(float(progress), 1)
-            progress_float = min(1.0, max(0.0, progress_float))
-            formatted.append(f"Subtask: {subtask.strip()}; Progress: {progress_float:.1f}\n")
+            text = format_subtask_output(subtask, progress)
+            formatted.append(f"{text}\n" if text else "")
 
         new_complementary_data = dict(complementary_data)
         if isinstance(complementary_data.get(self.subtask_key), str):

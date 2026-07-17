@@ -181,6 +181,18 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         or key.startswith("advantage_loss_weight_")
         or key == "advantage_condition_kept"
     }
+    memory_data = {key: value for key, value in batch.items() if key.startswith("memory_")}
+    subtask_time_data = {
+        key: batch[key]
+        for key in (
+            "subtask_elapsed_seconds",
+            "subtask_time_valid",
+            "subtask_segment_index",
+            "subtask_time_seconds",
+            "subtask_time_condition_kept",
+        )
+        if key in batch
+    }
 
     return {
         **pad_keys,
@@ -191,6 +203,8 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         **task_index_key,
         **episode_index_key,
         **advantage_data,
+        **memory_data,
+        **subtask_time_data,
     }
 
 

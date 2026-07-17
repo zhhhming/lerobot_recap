@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import logging
 from types import SimpleNamespace
 
 import torch
@@ -209,7 +210,7 @@ class _FakeTokenizer:
         return ["Subtask: pick; Progress: 0.5"]
 
 
-def test_pi05_policy_predict_action_chunk_decodes_generated_subtask_text():
+def test_pi05_policy_predict_action_chunk_decodes_generated_subtask_text(caplog):
     class _FakeModel:
         def __init__(self):
             self._last_subtask_tokens = None
@@ -231,13 +232,24 @@ def test_pi05_policy_predict_action_chunk_decodes_generated_subtask_text():
     policy._preprocess_images = lambda batch: ([], [])
     policy.eval = lambda: None
 
-    actions = PI05Policy.predict_action_chunk(
-        policy,
-        {
-            OBS_LANGUAGE_TOKENS: torch.ones(1, 2, dtype=torch.long),
-            OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 2, dtype=torch.bool),
-        },
-    )
+    with caplog.at_level(logging.DEBUG):
+        actions = PI05Policy.predict_action_chunk(
+            policy,
+            {
+                OBS_LANGUAGE_TOKENS: torch.ones(1, 2, dtype=torch.long),
+                OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 2, dtype=torch.bool),
+            },
+        )
+        PI05Policy.predict_action_chunk(
+            policy,
+            {
+                OBS_LANGUAGE_TOKENS: torch.ones(1, 2, dtype=torch.long),
+                OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 2, dtype=torch.bool),
+            },
+        )
 
     assert actions.shape == (1, 2, 2)
     assert policy.last_subtask_text == "Subtask: pick; Progress: 0.5"
+    subtask_records = [record for record in caplog.records if "[subtask]" in record.getMessage()]
+    assert len(subtask_records) == 1
+    assert subtask_records[0].levelno == logging.DEBUG

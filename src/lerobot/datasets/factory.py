@@ -22,8 +22,18 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.memory_history import (
+    DEFAULT_MEMORY_LOOKBACK_MAX_FRAMES,
+    DEFAULT_MEMORY_LOOKBACK_MIN_FRAMES,
+    MemoryHistoryDataset,
+    validate_memory_history_features,
+)
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+from lerobot.datasets.subtask_timing import (
+    SubtaskTimingDataset,
+    validate_subtask_timing_features,
+)
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
 
@@ -66,7 +76,9 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def make_dataset(
+    cfg: TrainPipelineConfig,
+) -> LeRobotDataset | MultiLeRobotDataset | MemoryHistoryDataset | SubtaskTimingDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -76,8 +88,36 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         NotImplementedError: The MultiLeRobotDataset is currently deactivated.
 
     Returns:
-        LeRobotDataset | MultiLeRobotDataset
+        LeRobotDataset | MultiLeRobotDataset | MemoryHistoryDataset | SubtaskTimingDataset
     """
+    use_memory_conditioning = bool(getattr(cfg.policy, "use_memory_conditioning", False))
+    use_subtask_time_conditioning = bool(
+        getattr(cfg.policy, "use_subtask_time_conditioning", False)
+    )
+    if use_subtask_time_conditioning:
+        if cfg.policy.type not in {"pi0", "pi05"}:
+            raise ValueError(
+                "Subtask time conditioning currently supports only pi0 and pi05 policies, "
+                f"got {cfg.policy.type!r}."
+            )
+        if not bool(getattr(cfg.policy, "predict_subtask", False)):
+            raise ValueError("Subtask time conditioning requires predict_subtask=True.")
+        if cfg.dataset.streaming:
+            raise ValueError(
+                "Subtask time conditioning requires a non-streaming dataset; "
+                "set --dataset.streaming=false."
+            )
+    if use_memory_conditioning:
+        if cfg.policy.type not in {"pi0", "pi05"}:
+            raise ValueError(
+                "Memory conditioning currently supports only pi0 and pi05 policies, "
+                f"got {cfg.policy.type!r}."
+            )
+        if cfg.dataset.streaming:
+            raise ValueError(
+                "Memory conditioning requires a non-streaming dataset; set --dataset.streaming=false."
+            )
+
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
@@ -86,6 +126,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+        if use_memory_conditioning:
+            validate_memory_history_features(ds_meta.features)
+        if use_subtask_time_conditioning:
+            validate_subtask_timing_features(ds_meta.features)
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
@@ -127,5 +171,19 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    if use_subtask_time_conditioning:
+        dataset = SubtaskTimingDataset(dataset)
+
+    if use_memory_conditioning:
+        dataset = MemoryHistoryDataset(
+            dataset,
+            lookback_min_frames=getattr(
+                cfg, "memory_lookback_min_frames", DEFAULT_MEMORY_LOOKBACK_MIN_FRAMES
+            ),
+            lookback_max_frames=getattr(
+                cfg, "memory_lookback_max_frames", DEFAULT_MEMORY_LOOKBACK_MAX_FRAMES
+            ),
+        )
 
     return dataset

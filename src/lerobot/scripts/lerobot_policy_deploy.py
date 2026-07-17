@@ -28,19 +28,31 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts, dataset_to_policy_features
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.subtask_timing import (
+    SUBTASK_TIMING_COLUMNS,
+    SubtaskSequenceContract,
+    scan_subtask_timing,
+    validate_subtask_timing_features,
+)
 from lerobot.datasets.utils import DEFAULT_FEATURES
 from lerobot.inference_engines import RTCInferenceEngine
 from lerobot.inference_engines.robot_wrapper import ThreadSafeRobot
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc import ActionInterpolator, RTCConfig
-from lerobot.processor import make_default_processors
+from lerobot.processor import SubtaskTimeConditionProcessorStep, make_default_processors
 from lerobot.robots import RobotConfig, make_robot_from_config
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.terminal_status import (
+    TerminalStatusDisplay,
+    _format_consumed_event,
+    _format_deploy_status_lines,
+)
 from lerobot.utils.utils import init_logging, log_say
 
 # Import config modules so draccus can resolve --robot.type.
@@ -98,6 +110,10 @@ class PolicyDeployConfig:
     home_speed_rad_s: float = 0.4
     hf_hub_offline: bool = True
     play_sounds: bool = True
+    use_subtask_time_conditioning: bool | None = None
+    subtask_time_deployment_margin_seconds: float = 5.0
+    status_display: Literal["auto", "live", "plain"] = "auto"
+    status_refresh_hz: float = 4.0
 
     def __post_init__(self):
         policy_path = parser.get_path_arg("policy")
@@ -123,10 +139,106 @@ class PolicyDeployConfig:
             raise ValueError("--home_speed_rad_s must be > 0.")
         if self.home_joints_rad is not None and len(self.home_joints_rad) != 7:
             raise ValueError("--home_joints_rad must contain 7 joint values.")
+        _validate_subtask_time_deployment_margin(self.subtask_time_deployment_margin_seconds)
+        if self.use_subtask_time_conditioning not in (None, False, True):
+            raise ValueError("--use_subtask_time_conditioning must be true, false, or omitted.")
+        if self.status_display not in ("auto", "live", "plain"):
+            raise ValueError("--status_display must be one of: auto, live, plain.")
+        if not math.isfinite(self.status_refresh_hz) or self.status_refresh_hz <= 0:
+            raise ValueError("--status_refresh_hz must be > 0.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         return ["policy"]
+
+
+def _validate_subtask_time_deployment_margin(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Subtask-time deployment margin must be a real scalar.")
+    margin = float(value)
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError("Subtask-time deployment margin must be finite and non-negative.")
+    return margin
+
+
+def _resolve_subtask_time_enabled(
+    *, checkpoint_enabled: bool, deploy_override: bool | None
+) -> bool:
+    checkpoint_enabled = bool(checkpoint_enabled)
+    if deploy_override is None:
+        return checkpoint_enabled
+    if not isinstance(deploy_override, bool):
+        raise ValueError("Deploy subtask-time override must be true, false, or omitted.")
+    if deploy_override and not checkpoint_enabled:
+        raise ValueError(
+            "Cannot force subtask elapsed-time conditioning on for a checkpoint that was not "
+            "trained with use_subtask_time_conditioning=true."
+        )
+    return deploy_override
+
+
+def _validate_subtask_time_processor_presence(
+    preprocessor,
+    *,
+    checkpoint_enabled: bool,
+    effective_enabled: bool,
+) -> None:
+    steps = getattr(preprocessor, "steps", ())
+    count = sum(isinstance(step, SubtaskTimeConditionProcessorStep) for step in steps)
+    if count > 1:
+        raise ValueError(
+            "Checkpoint preprocessor must contain exactly one "
+            "SubtaskTimeConditionProcessorStep; duplicate steps were found."
+        )
+    if checkpoint_enabled and count == 0:
+        raise ValueError(
+            "Checkpoint config enables subtask elapsed-time conditioning but the saved "
+            "preprocessor is missing SubtaskTimeConditionProcessorStep."
+        )
+    if effective_enabled and count != 1:
+        raise ValueError(
+            "Effective subtask elapsed-time deployment requires exactly one "
+            "SubtaskTimeConditionProcessorStep in the checkpoint preprocessor."
+        )
+
+
+def _load_subtask_time_sequence_contract(
+    dataset_cfg,
+    *,
+    effective_enabled: bool,
+    deployment_margin_seconds: float,
+) -> SubtaskSequenceContract | None:
+    if not effective_enabled:
+        return None
+    if not getattr(dataset_cfg, "repo_id", None):
+        raise ValueError(
+            "Subtask elapsed-time deployment requires --dataset.repo_id for sequence and cap scanning."
+        )
+    margin = _validate_subtask_time_deployment_margin(deployment_margin_seconds)
+    dataset = LeRobotDataset(
+        dataset_cfg.repo_id,
+        root=dataset_cfg.root,
+        revision=dataset_cfg.revision,
+        download_videos=False,
+    )
+    validate_subtask_timing_features(dataset.meta.features)
+    rows = dataset.select_columns(list(SUBTASK_TIMING_COLUMNS))
+    scan = scan_subtask_timing(
+        rows,
+        fps=dataset.meta.fps,
+        deployment_margin_seconds=margin,
+        dataset_name=f"{dataset.repo_id} ({dataset.root})",
+    )
+    contract = scan.sequence_contract
+    logger.info(
+        "Loaded subtask elapsed-time sequence contract: dataset=%s fps=%.3f subtasks=%d "
+        "deployment_margin=%.1fs",
+        dataset.repo_id,
+        contract.fps,
+        len(contract.ordered_subtasks),
+        margin,
+    )
+    return contract
 
 
 class KeyboardEvents:
@@ -328,6 +440,40 @@ class ActionSmoother:
         return out
 
 
+class _PolicyDeployRuntime:
+    """Apply explicit fresh-session versus resumable soft-pause semantics."""
+
+    def __init__(self, engine, interpolator, smoother) -> None:
+        self._engine = engine
+        self._interpolator = interpolator
+        self._smoother = smoother
+        self.paused_session_resumable = False
+
+    def _reset_local_action_state(self) -> None:
+        self._interpolator.reset()
+        self._smoother.reset()
+
+    def start_or_resume(self) -> None:
+        if self.paused_session_resumable:
+            logger.info("Resuming policy session with frozen subtask elapsed-time state.")
+        else:
+            self._engine.full_reset()
+            self._reset_local_action_state()
+            logger.info("Starting a fresh policy session with no subtask elapsed-time state.")
+        self._engine.resume()
+        self.paused_session_resumable = True
+
+    def soft_pause(self) -> None:
+        self._engine.soft_pause()
+        self._reset_local_action_state()
+        self.paused_session_resumable = True
+
+    def full_reset(self) -> None:
+        self._engine.full_reset()
+        self._reset_local_action_state()
+        self.paused_session_resumable = False
+
+
 def _ordered_action_keys(features: dict) -> list[str]:
     return list(features[ACTION]["names"])
 
@@ -451,6 +597,8 @@ def _build_engine(
     dataset_features: dict,
     dataset_fps: int,
     shutdown_event: Event,
+    subtask_sequence_contract: SubtaskSequenceContract | None = None,
+    subtask_time_enabled: bool = False,
 ) -> RTCInferenceEngine:
     cfg.rtc.enabled = True
     if hasattr(policy.config, "rtc_config"):
@@ -469,6 +617,8 @@ def _build_engine(
         device=cfg.policy.device,
         rtc_queue_threshold=cfg.rtc_queue_threshold,
         shutdown_event=shutdown_event,
+        subtask_sequence_contract=subtask_sequence_contract,
+        subtask_time_enabled=subtask_time_enabled,
     )
 
 
@@ -576,6 +726,21 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+    checkpoint_subtask_time_enabled = bool(
+        getattr(cfg.policy, "use_subtask_time_conditioning", False)
+    )
+    effective_subtask_time_enabled = _resolve_subtask_time_enabled(
+        checkpoint_enabled=checkpoint_subtask_time_enabled,
+        deploy_override=cfg.use_subtask_time_conditioning,
+    )
+    if checkpoint_subtask_time_enabled and not effective_subtask_time_enabled:
+        logger.info("Subtask elapsed-time conditioning disabled by deploy ablation override.")
+    subtask_sequence_contract = _load_subtask_time_sequence_contract(
+        cfg.dataset,
+        effective_enabled=effective_subtask_time_enabled,
+        deployment_margin_seconds=cfg.subtask_time_deployment_margin_seconds,
+    )
+
     dataset_meta = None
     if cfg.dataset.repo_id is not None:
         dataset_meta = LeRobotDatasetMetadata(
@@ -599,6 +764,12 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
     shutdown_event = Event()
     listener = None
     engine = None
+    status_display = TerminalStatusDisplay(
+        logger=logging.getLogger(),
+        mode=cfg.status_display,
+        refresh_hz=cfg.status_refresh_hz,
+    )
+    status_display.start()
 
     try:
         policy = _load_policy_from_model_dir(cfg.policy)
@@ -609,6 +780,11 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
                 "device_processor": {"device": cfg.policy.device},
                 "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
             },
+        )
+        _validate_subtask_time_processor_presence(
+            preprocessor,
+            checkpoint_enabled=checkpoint_subtask_time_enabled,
+            effective_enabled=effective_subtask_time_enabled,
         )
 
         robot.connect()
@@ -627,6 +803,8 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             dataset_features,
             dataset_fps,
             shutdown_event,
+            subtask_sequence_contract=subtask_sequence_contract,
+            subtask_time_enabled=effective_subtask_time_enabled,
         )
         engine.start()
         engine.pause()
@@ -639,12 +817,15 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
         action_keys = list(getattr(cfg.policy, "action_feature_names", None) or _ordered_action_keys(dataset_features))
         interpolator = ActionInterpolator(multiplier=obs_stride)
         smoother = ActionSmoother(alpha=cfg.smoother_alpha, smooth_keys=_smooth_action_keys(dataset_features))
+        policy_runtime = _PolicyDeployRuntime(engine, interpolator, smoother)
         obs_cache = ObsCache()
         home_by_prefix = _default_home_joints_from_robot_config(cfg.robot, cfg.home_joints_rad)
         homing_waypoints: deque[dict[str, float]] = deque()
 
         state: DeployState = "paused"
         stop_requested = False
+        last_consumed_event = "<none>"
+        last_status_state: DeployState | None = None
 
         policy_param = next(policy.parameters(), None)
         logger.info(
@@ -656,22 +837,32 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             getattr(cfg.policy, "compile_mode", None),
         )
 
-        def clear_policy_state() -> None:
-            engine.pause()
-            engine.reset()
-            interpolator.reset()
-            smoother.reset()
+        def refresh_status(*, force: bool = False) -> None:
+            nonlocal last_status_state
+            state_changed = state != last_status_state
+            force = force or state_changed
+            if not status_display.refresh_due(force=force):
+                return
+            rtc_debug = engine.debug_snapshot()
+            status_display.update(
+                _format_deploy_status_lines(
+                    state=state,
+                    event_text=last_consumed_event,
+                    rtc_debug=rtc_debug,
+                ),
+                force=force,
+            )
+            last_status_state = state
 
         def prepare_policy() -> None:
             nonlocal state
-            clear_policy_state()
+            policy_runtime.start_or_resume()
             state = "preparing"
-            engine.resume()
             log_say("Preparing policy", cfg.play_sounds)
 
         def pause_policy() -> None:
             nonlocal state, homing_waypoints
-            clear_policy_state()
+            policy_runtime.soft_pause()
             homing_waypoints.clear()
             state = "paused"
             log_say("Paused", cfg.play_sounds)
@@ -681,7 +872,7 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             if not obs_cache.ready or obs_cache.raw is None:
                 logger.warning("Cannot home before the first observation is available.")
                 return
-            clear_policy_state()
+            policy_runtime.full_reset()
             homing_waypoints = _start_homing(
                 obs_cache.raw,
                 action_keys,
@@ -693,6 +884,7 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             state = "homing"
             log_say("Homing", cfg.play_sounds)
 
+        refresh_status(force=True)
         log_say("Paused. Press right arrow to start policy.", cfg.play_sounds)
 
         loop_i = 0
@@ -713,20 +905,26 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             interp_empty = False
 
             if shutdown_event.is_set() or (engine is not None and engine.failed):
+                refresh_status(force=True)
                 logger.error("Inference engine failed; stopping policy deployment.")
                 log_say("Inference engine failed; stopping", cfg.play_sounds)
                 break
 
             event = events.pop_latest()
+            if event is not None:
+                last_consumed_event = _format_consumed_event(event)
             if event == "esc":
                 stop_requested = True
+                refresh_status(force=True)
                 break
-            if event == "right" and state in ("paused", "preparing"):
+            if event == "right" and state == "paused":
                 prepare_policy()
             elif event == "space" and state in ("preparing", "running", "homing"):
                 pause_policy()
             elif event == "h" and state == "paused":
                 begin_homing()
+            if event is not None:
+                refresh_status(force=True)
 
             is_obs_tick = loop_i % obs_stride == 0
             if is_obs_tick:
@@ -888,7 +1086,7 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
                 sends = max(debug_stats.get("sends", 0.0), 1.0)
                 period_count = max(debug_stats.get("actual_period_count", 0.0), 1.0)
                 sleep_count = max(debug_stats.get("sleep_count", 0.0), 1.0)
-                logger.info(
+                logger.debug(
                     "deploy_loop state=%s work_avg_hz=%.1f work_min_hz=%.1f actual_avg_hz=%.1f "
                     "actual_min_hz=%.1f target_hz=%.1f hist={lt11:%d,11-15:%d,15-25:%d,25-50:%d,gt50:%d} "
                     "obs_avg_ms=%.2f obs_max_ms=%.2f obs_proc_avg_ms=%.2f obs_proc_max_ms=%.2f "
@@ -940,16 +1138,20 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
                 )
                 last_debug_log_s = debug_now
                 debug_stats.clear()
+            refresh_status()
             loop_i += 1
 
     finally:
-        log_say("Stopping policy deployment", cfg.play_sounds, blocking=True)
-        if engine is not None:
-            engine.stop()
-        if robot.is_connected:
-            robot.disconnect()
-        if listener is not None:
-            listener.stop()
+        try:
+            log_say("Stopping policy deployment", cfg.play_sounds, blocking=True)
+            if engine is not None:
+                engine.stop()
+            if robot.is_connected:
+                robot.disconnect()
+            if listener is not None:
+                listener.stop()
+        finally:
+            status_display.stop()
 
 
 def main():

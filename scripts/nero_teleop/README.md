@@ -392,6 +392,7 @@ lerobot-push-dataset \
 | `--branch` | `None` | 上传到指定分支 |
 | `--private` | `false` | 私有数据集 |
 | `--proxy` | `None` | HTTP/SOCKS 代理 URL（公司网络内常用） |
+| `--disable-xet` | `false` | 禁用 Xet，代理网络不稳定时改用标准 HTTP/LFS 上传 |
 | `--tls-max-1-2` | `false` | 限制 TLS 最高 1.2（部分代理兼容需要） |
 | `--upload-large-folder` | `false` | 用 `upload_large_folder`，适合超大数据集 |
 | `--num-workers` | `None` | 大文件夹上传的并发线程数 |
@@ -473,6 +474,8 @@ lerobot-policy-deploy \
   --policy.path=<OUTPUT_DIR>/<JOB_NAME>/checkpoints/<STEP>/pretrained_model \
   --rtc.execution_horizon=10 \
   --rtc_queue_threshold=40 \
+  --dataset.repo_id=ming326/strike_match_3_subtask \
+  --dataset.root=/home/zenbot-robot/.cache/huggingface/lerobot/ming326/strike_match_3_subtask \
   --dataset.fps=30 \
   --dataset.task="Pick up the match in front, strike it to light it, then use it to light the small candle on the cake in front." \
   --policy_gripper_max_width_m=0.05 \
@@ -489,6 +492,9 @@ lerobot-policy-deploy \
 | `--dataset.fps` | `30` | 观测/控制频率（Hz） |
 | `--dataset.task` | — | 任务描述（语言条件策略需要） |
 | `--dataset.repo_id` | `None` | 参考数据集（用于校验元数据） |
+| `--dataset.root` | `None` | 本地参考数据集路径；elapsed-time 部署使用本地数据时应显式提供 |
+| `--use_subtask_time_conditioning` | `None` | 默认跟随 checkpoint；只能用 `false` 关闭做 ablation，不能给旧 checkpoint 强制开启 |
+| `--subtask_time_deployment_margin_seconds` | `5.0` | 每个 subtask 的部署时间上限为数据集最大真实持续时间加该 margin |
 | `--control_multiplier` | `3` | 控制频率 = `fps × multiplier` |
 | `--policy_gripper_max_width_m` | `0.1` | 夹爪最大开度上限 (0, 0.1] |
 | `--policy.dtype` | — | 推理精度，如 `bfloat16` |
@@ -497,6 +503,13 @@ lerobot-policy-deploy \
 | `--smoother_alpha` | `1.0` | EMA 平滑（1.0=关闭） |
 
 键盘控制：`→` 启动策略，`Space` 暂停，`h`（暂停时）回 home，`Esc` 退出。
+
+当 checkpoint 启用了 subtask elapsed-time conditioning 时，部署会从 `--dataset.repo_id` 指定的逐帧
+`subtask` 标注中严格提取固定顺序和各段最大持续时间，不在代码中硬编码任务文本。启动或 home 后，状态面板先显示
+`[TIME] waiting-for-first-subtask`；模型成功提交序列第一项后才启动 monotonic timer。`Space` 会清空旧动作队列、观测和
+policy/processor runtime cache，同时冻结并保留当前 subtask 时间；再次按 `→` 从冻结值继续，暂停墙钟时间不累计。
+暂停后按 `h` 会执行 full reset 并清空 tracker，home 完成后必须重新从序列第一项开始。面板中的 `raw` 是实际 active
+elapsed，`input` 是最近一次送给模型的截断值，`cap` 是数据集 maximum 加 margin。
 
 #### RTC（实时分块）参数说明
 

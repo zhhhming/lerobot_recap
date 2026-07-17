@@ -105,6 +105,14 @@ class PI05Config(PreTrainedConfig):
     advantage_condition_format: str = "Advantage: {label}"
     inference_advantage_label: str = "positive"
 
+    # Optional previous subtask/progress condition in the main prompt
+    use_memory_conditioning: bool = False
+    memory_tokenizer_max_length: int = 128
+
+    # Optional current-subtask elapsed-time condition in the main prompt
+    use_subtask_time_conditioning: bool = False
+    subtask_time_tokenizer_max_length: int = 128
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -141,6 +149,27 @@ class PI05Config(PreTrainedConfig):
 
         if self.predict_subtask and self.train_expert_only:
             raise ValueError("predict_subtask=True requires train_expert_only=False so the VLM can learn")
+
+        if self.memory_tokenizer_max_length <= 0:
+            raise ValueError("memory_tokenizer_max_length must be positive")
+        if self.use_memory_conditioning and not self.predict_subtask:
+            raise ValueError("use_memory_conditioning=True requires predict_subtask=True")
+        if self.use_memory_conditioning and not self.subtask_generate_at_inference:
+            warnings.warn(
+                "subtask_generate_at_inference=False cannot update deployment memory; "
+                "memory conditioning will remain empty during deployment.",
+                stacklevel=2,
+            )
+        if self.subtask_time_tokenizer_max_length <= 0:
+            raise ValueError("subtask_time_tokenizer_max_length must be positive")
+        if self.use_subtask_time_conditioning and not self.predict_subtask:
+            raise ValueError("use_subtask_time_conditioning=True requires predict_subtask=True")
+        if self.use_subtask_time_conditioning and not self.subtask_generate_at_inference:
+            warnings.warn(
+                "subtask_generate_at_inference=False cannot advance deployment elapsed-time "
+                "conditioning; it will remain unavailable during deployment.",
+                stacklevel=2,
+            )
 
         if self.inference_advantage_label not in {"positive", "negative", "none"}:
             raise ValueError(

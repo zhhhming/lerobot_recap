@@ -458,7 +458,7 @@ def test_merge_validates_delay_consistency(action_queue_rtc_enabled, sample_acti
     )
 
     # Check warning was logged
-    assert "Indexes diff is not equal to real delay" in caplog.text
+    assert "Using lock-local action index delay" in caplog.text
 
 
 def test_merge_no_warning_when_delays_match(action_queue_rtc_enabled, sample_actions, caplog):
@@ -483,7 +483,7 @@ def test_merge_no_warning_when_delays_match(action_queue_rtc_enabled, sample_act
     )
 
     # Should not have warning
-    assert "Indexes diff is not equal to real delay" not in caplog.text
+    assert "Using lock-local action index delay" not in caplog.text
 
 
 def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled, sample_actions, caplog):
@@ -506,7 +506,7 @@ def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled,
     )
 
     # Should not warn (validation skipped)
-    assert "Indexes diff is not equal to real delay" not in caplog.text
+    assert "Using lock-local action index delay" not in caplog.text
 
 
 # Thread safety tests
@@ -792,6 +792,9 @@ def test_typical_rtc_workflow(action_queue_rtc_enabled, sample_actions):
 
     # Second inference with delay
     action_index_before = action_queue_rtc_enabled.get_action_index()
+    for _ in range(5):
+        action = action_queue_rtc_enabled.get()
+        assert action is not None
 
     action_queue_rtc_enabled.merge(
         sample_actions["original"],
