@@ -274,8 +274,8 @@ PI0 peak allocated CUDA memory为 `8648.9 MiB`，PI0.5 为 `9099.5 MiB`。
 原始 PI0 和 PI0.5 checkpoint 分别以 memory/time off 驱动真实模型 RTC：
 
 ```text
-PI0: tokenizer=48, finite action, no memory/time state, latency=328.3ms
-PI0.5: tokenizer=200, finite action, no memory/time state, latency=677.4ms
+PI0: tokenizer=48, finite action, no memory/time state, latency=328.3–506.7ms
+PI0.5: tokenizer=200, finite action, no memory/time state, latency=507.0–677.4ms
 ```
 
 两者 strict load 均为 clean，reset 清空 runtime；同时 T0 两条 byte/tensor golden 继续通过：
