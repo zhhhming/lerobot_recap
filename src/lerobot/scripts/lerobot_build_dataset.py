@@ -7,6 +7,7 @@ Usage:
 
     lerobot-build-dataset \
         --runs /path/to/raw/run_a /path/to/raw/run_b \
+        --episode_indices '[0, 1, 2]' \
         --output_repo_id user/my_dataset \
         --video true \
         --vcodec libsvtav1 \
@@ -22,7 +23,7 @@ import fnmatch
 import json
 import logging
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -34,9 +35,15 @@ import pyarrow.parquet as pq
 
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.raw_media import (
+    RawImageEncoding,
+    raw_frame_image_path,
+    raw_image_encoding_from_meta,
+    validate_raw_format_version,
+)
 from lerobot.datasets.utils import INFO_PATH
 from lerobot.datasets.video_utils import VideoEncodingManager
-from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
+from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
 from lerobot.value_function.raw_io import (
@@ -58,7 +65,6 @@ from lerobot.value_function.schema import (
 logger = logging.getLogger(__name__)
 
 
-RAW_FORMAT_VERSION = 1
 RUN_META_FILENAME = "run_meta.json"
 
 
@@ -66,6 +72,7 @@ RUN_META_FILENAME = "run_meta.json"
 class BuildDatasetConfig:
     runs: list[str]
     output_repo_id: str
+    episode_indices: list[int] | None = None
     output_root: str | None = None
     video: bool = True
     vcodec: str = "libsvtav1"
@@ -90,6 +97,11 @@ class BuildDatasetConfig:
             raise ValueError("--runs must list at least one raw run directory.")
         if not self.output_repo_id:
             raise ValueError("--output_repo_id is required.")
+        if self.episode_indices is not None:
+            if any(index < 0 for index in self.episode_indices):
+                raise ValueError("--episode_indices must contain only non-negative integers.")
+            if len(set(self.episode_indices)) != len(self.episode_indices):
+                raise ValueError("--episode_indices must not contain duplicates.")
 
 
 def _parse_patterns(value: str) -> list[str]:
@@ -117,11 +129,7 @@ def _load_run_meta(run_dir: Path) -> dict:
         raise FileNotFoundError(f"Missing {RUN_META_FILENAME} in '{run_dir}'.")
     with open(meta_path) as f:
         meta = json.load(f)
-    if meta.get("version") != RAW_FORMAT_VERSION:
-        raise ValueError(
-            f"Raw format version mismatch in '{run_dir}': expected {RAW_FORMAT_VERSION}, "
-            f"got {meta.get('version')}."
-        )
+    validate_raw_format_version(meta, run_dir)
     meta["features"] = _deserialize_features(meta["features"])
     return meta
 
@@ -151,13 +159,8 @@ def _merge_features(meta_features: list[dict]) -> dict:
                 f"only in run 0={base_only}, only in run {i}={other_only}"
             )
         for k in base:
-            if base[k]["dtype"] != other[k]["dtype"] or tuple(base[k]["shape"]) != tuple(
-                other[k]["shape"]
-            ):
-                raise ValueError(
-                    f"Feature '{k}' mismatch between runs 0 and {i}: "
-                    f"{base[k]} vs {other[k]}"
-                )
+            if base[k]["dtype"] != other[k]["dtype"] or tuple(base[k]["shape"]) != tuple(other[k]["shape"]):
+                raise ValueError(f"Feature '{k}' mismatch between runs 0 and {i}: {base[k]} vs {other[k]}")
     return base
 
 
@@ -208,9 +211,7 @@ def _load_extras_schema(ep_dirs: list[Path]) -> tuple[dict, set[str]]:
     for ep, p in extras_paths[1:]:
         sch = pq.read_schema(p)
         if not sch.equals(first_schema, check_metadata=False):
-            raise ValueError(
-                f"extras.parquet schema differs in {ep}: {sch} vs {first_schema}"
-            )
+            raise ValueError(f"extras.parquet schema differs in {ep}: {sch} vs {first_schema}")
 
     extras_features: dict = {}
     for name in first_schema.names:
@@ -243,9 +244,7 @@ def _load_extras_schema(ep_dirs: list[Path]) -> tuple[dict, set[str]]:
     return extras_features, set(first_schema.names)
 
 
-def _validate_selected_value_pipeline_artifacts(
-    run_dirs: list[Path], selected_extras: set[str]
-) -> None:
+def _validate_selected_value_pipeline_artifacts(run_dirs: list[Path], selected_extras: set[str]) -> None:
     """Reject stale or untracked label/weight artifacts selected for dataset build."""
 
     stage_columns = {
@@ -347,6 +346,7 @@ def _row_to_frame(
     scalar_keys: list[str],
     ep_dir: Path,
     cam_subdir: dict[str, str],
+    image_encoding: RawImageEncoding,
 ) -> dict[str, Any]:
     frame: dict[str, Any] = {}
     for k in scalar_keys:
@@ -359,7 +359,7 @@ def _row_to_frame(
             frame[k] = v
     for k in image_keys:
         subdir = cam_subdir[k]
-        path = ep_dir / subdir / f"{row['frame_index']:06d}.png"
+        path = raw_frame_image_path(ep_dir, subdir, row["frame_index"], image_encoding)
         if not path.is_file():
             raise FileNotFoundError(f"Missing frame image {path}")
         with PIL.Image.open(path) as img:
@@ -378,6 +378,9 @@ def build_dataset(cfg: BuildDatasetConfig) -> LeRobotDataset | None:
 
     run_dirs = [Path(p).expanduser().resolve() for p in cfg.runs]
     metas = [_load_run_meta(rd) for rd in run_dirs]
+    image_encodings = {
+        run_dir: raw_image_encoding_from_meta(meta) for run_dir, meta in zip(run_dirs, metas, strict=True)
+    }
 
     fps_values = {m["fps"] for m in metas}
     if cfg.fps is None and len(fps_values) > 1:
@@ -391,10 +394,28 @@ def build_dataset(cfg: BuildDatasetConfig) -> LeRobotDataset | None:
 
     merged_raw_features = _merge_features([m["features"] for m in metas])
 
+    selected_episode_indices = (
+        set(cfg.episode_indices) if cfg.episode_indices is not None else None
+    )
+    found_episode_indices: set[int] = set()
     all_eps: list[tuple[Path, Path]] = []
     for run_dir in run_dirs:
         for ep in _discover_episodes(run_dir):
+            try:
+                episode_index = int(ep.name.removeprefix("ep_"))
+            except ValueError as exc:
+                raise ValueError(f"Invalid raw episode directory name: {ep.name!r}") from exc
+            if (
+                selected_episode_indices is not None
+                and episode_index not in selected_episode_indices
+            ):
+                continue
+            found_episode_indices.add(episode_index)
             all_eps.append((run_dir, ep))
+    if selected_episode_indices is not None:
+        missing = sorted(selected_episode_indices - found_episode_indices)
+        if missing:
+            raise ValueError(f"Requested raw episode indices were not found: {missing}")
     if not all_eps:
         raise ValueError("No episodes found across the provided runs.")
     logger.info("Discovered %d episodes across %d runs.", len(all_eps), len(run_dirs))
@@ -458,6 +479,7 @@ def build_dataset(cfg: BuildDatasetConfig) -> LeRobotDataset | None:
                     scalar_keys=scalar_keys,
                     extras_keys=extras_keys,
                     cam_subdir=cam_subdir,
+                    image_encoding=image_encodings[run_dir],
                     task_override=cfg.task_override,
                 )
         dataset.finalize()
@@ -484,6 +506,7 @@ def _build_one_episode(
     scalar_keys: list[str],
     extras_keys: list[str],
     cam_subdir: dict[str, str],
+    image_encoding: RawImageEncoding,
     task_override: str | None,
 ) -> None:
     info_path = ep_dir / "info.json"
@@ -519,6 +542,7 @@ def _build_one_episode(
             scalar_keys=scalar_keys,
             ep_dir=ep_dir,
             cam_subdir=cam_subdir,
+            image_encoding=image_encoding,
         )
         if extras_rows:
             extras_dict = _load_extras_row_as_dict(extras_rows[i], final_features)

@@ -35,6 +35,8 @@ from urllib.parse import unquote, urlparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.datasets.raw_media import raw_frame_image_path, raw_image_encoding_from_meta
+
 logger = logging.getLogger("subtask_annotator")
 
 RUN_META_FILENAME = "run_meta.json"
@@ -50,8 +52,16 @@ CONNECTION_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedErr
 
 # A pleasant default palette offered to the UI when creating new subtasks.
 DEFAULT_PALETTE = [
-    "#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#b07aa1",
-    "#76b7b2", "#edc948", "#ff9da7", "#9c755f", "#bab0ac",
+    "#4e79a7",
+    "#f28e2b",
+    "#59a14f",
+    "#e15759",
+    "#b07aa1",
+    "#76b7b2",
+    "#edc948",
+    "#ff9da7",
+    "#9c755f",
+    "#bab0ac",
 ]
 
 
@@ -72,17 +82,14 @@ class RawRun:
         self.task = self.meta.get("task", "")
         self.robot_type = self.meta.get("robot_type", "")
         self.features = self.meta.get("features", {})
+        self.image_encoding = raw_image_encoding_from_meta(self.meta)
 
-        self.image_keys = [
-            k for k, v in self.features.items() if v.get("dtype") in ("image", "video")
-        ]
+        self.image_keys = [k for k, v in self.features.items() if v.get("dtype") in ("image", "video")]
         # camera subdir name == last dotted component, matching the recorder.
         self.cam_subdir = {k: k.split(".")[-1] for k in self.image_keys}
 
         self.action_names = list(self.features.get("action", {}).get("names") or [])
-        self.state_names = list(
-            self.features.get("observation.state", {}).get("names") or []
-        )
+        self.state_names = list(self.features.get("observation.state", {}).get("names") or [])
         self._frame_cache: dict[int, dict] = {}
 
     # -- episodes -----------------------------------------------------------
@@ -120,9 +127,7 @@ class RawRun:
         rows = table.num_rows
         action = table.column("action").to_pylist() if "action" in cols else [None] * rows
         state = (
-            table.column("observation.state").to_pylist()
-            if "observation.state" in cols
-            else [None] * rows
+            table.column("observation.state").to_pylist() if "observation.state" in cols else [None] * rows
         )
         wall = table.column("wall_time_s").to_pylist() if "wall_time_s" in cols else None
         source = table.column("source").to_pylist() if "source" in cols else None
@@ -332,9 +337,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(load_config(self.run))
             elif path == "/api/annotations":
                 self._send_json(load_annotations(self.run))
-            elif (m := re.match(r"^/api/episode/(\d+)$", path)):
+            elif m := re.match(r"^/api/episode/(\d+)$", path):
                 self._api_episode(int(m.group(1)))
-            elif (m := re.match(r"^/api/episode/(\d+)/img/([^/]+)/(\d+)$", path)):
+            elif m := re.match(r"^/api/episode/(\d+)/img/([^/]+)/(\d+)$", path):
                 self._api_image(int(m.group(1)), m.group(2), int(m.group(3)))
             else:
                 self._send_bytes(b"Not found", "text/plain", status=404, cache=False)
@@ -354,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = self._read_json_body()
                 save_config(self.run, cfg)
                 self._send_json({"ok": True})
-            elif (m := re.match(r"^/api/episode/(\d+)/annotation$", path)):
+            elif m := re.match(r"^/api/episode/(\d+)/annotation$", path):
                 self._api_save_annotation(int(m.group(1)))
             elif path == "/api/export":
                 summary = export_extras(self.run)
@@ -420,11 +425,11 @@ class Handler(BaseHTTPRequestHandler):
         run = self.run
         ep_dir = run.episode_dir(idx)
         # cam may be the subdir name directly.
-        path = ep_dir / cam / f"{frame:06d}.png"
+        path = raw_frame_image_path(ep_dir, cam, frame, run.image_encoding)
         if not path.is_file():
             self._send_bytes(b"Not found", "text/plain", status=404, cache=False)
             return
-        self._send_bytes(path.read_bytes(), "image/png", cache=True)
+        self._send_bytes(path.read_bytes(), run.image_encoding.mime_type, cache=True)
 
     def _api_save_annotation(self, idx: int):
         body = self._read_json_body()
@@ -439,9 +444,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--root", required=True, help="Raw run directory (contains run_meta.json)."
-    )
+    parser.add_argument("--root", required=True, help="Raw run directory (contains run_meta.json).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser.")

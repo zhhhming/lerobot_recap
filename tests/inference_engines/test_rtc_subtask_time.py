@@ -18,6 +18,7 @@ from lerobot.datasets.subtask_timing import (
     SubtaskSequenceContract,
     normalize_subtask_name,
 )
+from lerobot.inference_engines.memory_progress_assist import NeroEggMemoryProgressAssist
 from lerobot.inference_engines.rtc import RTCInferenceEngine
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor.memory_processor import MemoryConditionProcessorStep
@@ -179,6 +180,8 @@ def _make_engine(
     generate_subtask: bool = True,
     clock: _FakeClock | None = None,
     trace: list[str] | None = None,
+    contract: SubtaskSequenceContract | None = None,
+    memory_progress_assist: NeroEggMemoryProgressAssist | None = None,
 ) -> tuple[RTCInferenceEngine, _FakePolicy, _FakePreprocessor, _FakePostprocessor, _FakeClock]:
     trace = [] if trace is None else trace
     clock = _FakeClock(trace) if clock is None else clock
@@ -202,9 +205,10 @@ def _make_engine(
         fps=30,
         device="cpu",
         rtc_queue_threshold=0,
-        subtask_sequence_contract=_contract() if use_time else None,
+        subtask_sequence_contract=(contract or _contract()) if use_time else None,
         subtask_time_enabled=use_time,
         subtask_time_clock=clock,
+        memory_progress_assist=memory_progress_assist,
     )
     return engine, policy, preprocessor, postprocessor, clock
 
@@ -443,6 +447,53 @@ def test_time_disabled_injects_no_fields_and_maintains_no_tracker() -> None:
         assert snapshot["subtask_time_current_index"] is None
         assert snapshot["subtask_time_last_input_seconds"] is None
         assert engine._subtask_time_tracker is None
+    finally:
+        engine.stop()
+
+
+def test_nero_egg_memory_assist_and_subtask_time_run_independently_together() -> None:
+    trace: list[str] = []
+    clock = _FakeClock(trace)
+    frying = "Start frying the eggs."
+    output_point_seven = f"Subtask: {frying}; Progress: 0.7"
+    output_point_eight = f"Subtask: {frying}; Progress: 0.8"
+    frying_contract = SubtaskSequenceContract(
+        fps=30.0,
+        ordered_subtasks=(
+            SubtaskSegmentStats(
+                canonical_name=frying,
+                normalized_name=normalize_subtask_name(frying),
+                max_elapsed_seconds=10.0,
+                deployment_cap_seconds=15.0,
+            ),
+        ),
+    )
+    assist = NeroEggMemoryProgressAssist(clock=clock)
+    engine, policy, _, _, _ = _make_engine(
+        outputs=[output_point_seven, output_point_seven, output_point_seven],
+        clock=clock,
+        trace=trace,
+        contract=frying_contract,
+        memory_progress_assist=assist,
+    )
+
+    try:
+        _start_engine(engine, trace)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 1)
+        clock.advance(6.0)
+        _consume_committed_action(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 2)
+
+        snapshot = engine.debug_snapshot()
+        assert snapshot["subtask_time_current_name"] == frying
+        assert snapshot["subtask_time_last_input_seconds"] == pytest.approx(6.0)
+        assert snapshot["memory_progress_assist_forced"] is True
+        assert snapshot["memory_text_for_next_inference"] == output_point_eight
+
+        _consume_committed_action(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 3)
+        assert policy.inputs[2]["memory_text"] == [output_point_eight]
+        assert policy.inputs[2]["subtask_time_valid"] == [True]
     finally:
         engine.stop()
 

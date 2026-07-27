@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,172 @@ from lerobot.datasets.subtask_timing import (
     normalize_subtask_name,
 )
 from lerobot.processor.subtask_time_processor import SubtaskTimeConditionProcessorStep
+
+
+def _runtime_features() -> dict:
+    return {
+        "action": {"dtype": "float32", "shape": (2,), "names": ["joint.pos", "gripper.pos"]},
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint.pos", "gripper.pos"],
+        },
+        "observation.images.main": {
+            "dtype": "video",
+            "shape": (480, 640, 3),
+            "names": ["height", "width", "channels"],
+            "info": {"video.codec": "av1"},
+        },
+    }
+
+
+def _dataset_meta(*, runtime_features: dict | None = None) -> SimpleNamespace:
+    features = deepcopy(runtime_features or _runtime_features())
+    features.update(deepcopy(deploy_module.DEFAULT_FEATURES))
+    features.update(
+        {
+            "subtask": {"dtype": "string", "shape": (1,), "names": None},
+            "subtask_progress": {"dtype": "float32", "shape": (1,), "names": None},
+        }
+    )
+    return SimpleNamespace(robot_type="test_robot", fps=30, features=features)
+
+
+def test_metadata_compatibility_ignores_only_dataset_annotation_features_without_mutation():
+    runtime_features = _runtime_features()
+    dataset_meta = _dataset_meta(runtime_features=runtime_features)
+    original_features = deepcopy(dataset_meta.features)
+
+    deploy_module._check_metadata_compatibility(dataset_meta, "test_robot", 30, runtime_features)
+
+    assert dataset_meta.features == original_features
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_field"),
+    [
+        (lambda meta: setattr(meta, "robot_type", "other_robot"), "robot_type"),
+        (lambda meta: setattr(meta, "fps", 20), "fps"),
+        (lambda meta: meta.features["action"].update(shape=(3,)), "features"),
+        (lambda meta: meta.features["action"].update(dtype="float64"), "features"),
+        (
+            lambda meta: meta.features["observation.state"].update(
+                names=["other_joint.pos", "gripper.pos"]
+            ),
+            "features",
+        ),
+        (lambda meta: meta.features.pop("observation.images.main"), "features"),
+        (
+            lambda meta: meta.features.update(
+                {
+                    "observation.images.extra": {
+                        "dtype": "video",
+                        "shape": (480, 640, 3),
+                        "names": ["height", "width", "channels"],
+                    }
+                }
+            ),
+            "features",
+        ),
+        (
+            lambda meta: meta.features.update(
+                {"operator_note": {"dtype": "string", "shape": (1,), "names": None}}
+            ),
+            "features",
+        ),
+    ],
+)
+def test_metadata_compatibility_keeps_robot_fps_and_hardware_checks_strict(mutation, error_field):
+    runtime_features = _runtime_features()
+    dataset_meta = _dataset_meta(runtime_features=runtime_features)
+    mutation(dataset_meta)
+
+    with pytest.raises(ValueError, match=error_field):
+        deploy_module._check_metadata_compatibility(dataset_meta, "test_robot", 30, runtime_features)
+
+
+def test_metadata_compatibility_failure_happens_before_robot_connect(monkeypatch):
+    calls: list[str] = []
+
+    class FakeRobot:
+        robot_type = "test_robot"
+        is_connected = False
+
+        def connect(self):
+            calls.append("connect")
+            self.is_connected = True
+
+        def disconnect(self):
+            calls.append("disconnect")
+            self.is_connected = False
+
+    class FakeStatusDisplay:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            calls.append("status_start")
+
+        def stop(self):
+            calls.append("status_stop")
+
+    cfg = SimpleNamespace(
+        hf_hub_offline=False,
+        policy=SimpleNamespace(
+            use_subtask_time_conditioning=False,
+            pretrained_path="/tmp/checkpoint",
+            device="cpu",
+        ),
+        use_subtask_time_conditioning=None,
+        subtask_time_deployment_margin_seconds=5.0,
+        dataset=SimpleNamespace(
+            repo_id="owner/repo",
+            root="/tmp/dataset",
+            revision=None,
+            fps=30,
+            rename_map={},
+        ),
+        robot=SimpleNamespace(),
+        status_display="plain",
+        status_refresh_hz=1.0,
+        play_sounds=False,
+    )
+    robot = FakeRobot()
+    dataset_meta = _dataset_meta()
+
+    monkeypatch.setattr(deploy_module, "asdict", lambda _cfg: {})
+    monkeypatch.setattr(deploy_module, "init_logging", lambda: None)
+    monkeypatch.setattr(deploy_module, "log_say", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_module, "_load_subtask_time_sequence_contract", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_module, "LeRobotDatasetMetadata", lambda *_args, **_kwargs: dataset_meta)
+    monkeypatch.setattr(deploy_module, "make_robot_from_config", lambda _cfg: robot)
+    monkeypatch.setattr(deploy_module, "make_default_processors", lambda: (None, None, None))
+    monkeypatch.setattr(
+        deploy_module, "_build_dataset_features", lambda *_args, **_kwargs: _runtime_features()
+    )
+    monkeypatch.setattr(deploy_module, "TerminalStatusDisplay", FakeStatusDisplay)
+    monkeypatch.setattr(deploy_module, "_load_policy_from_model_dir", lambda _cfg: SimpleNamespace())
+    monkeypatch.setattr(
+        deploy_module,
+        "make_pre_post_processors",
+        lambda **_kwargs: (SimpleNamespace(steps=[]), SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        deploy_module,
+        "_validate_subtask_time_processor_presence",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fail_compatibility(*_args, **_kwargs):
+        calls.append("compatibility_check")
+        raise ValueError("incompatible metadata")
+
+    monkeypatch.setattr(deploy_module, "_check_metadata_compatibility", fail_compatibility)
+
+    with pytest.raises(ValueError, match="incompatible metadata"):
+        deploy_module.policy_deploy.__wrapped__(cfg)
+
+    assert calls == ["compatibility_check"]
 
 
 @pytest.mark.parametrize(

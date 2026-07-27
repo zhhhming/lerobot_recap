@@ -30,11 +30,7 @@ def _request(base, path):
             body = response.read()
             return (
                 response.status,
-                (
-                    json.loads(body)
-                    if response.headers.get_content_type() == "application/json"
-                    else body
-                ),
+                (json.loads(body) if response.headers.get_content_type() == "application/json" else body),
             )
     except HTTPError as exc:
         body = exc.read()
@@ -60,9 +56,7 @@ def test_static_meta_curves_frame_image_and_safe_errors(tmp_path):
         assert meta["episodes"][0] == {"index": 0, "name": "ep_000000", "length": 8}
         assert meta["provenance"]["subtask"]["status"] == "current"
 
-        status, curves = _request(
-            base, "/api/episode/0/curves?unit=norm&boundary=pred_smooth&max_points=5"
-        )
+        status, curves = _request(base, "/api/episode/0/curves?unit=norm&boundary=pred_smooth&max_points=5")
         assert status == 200
         assert curves["sampled_points"] == 5
         assert curves["subtask_intervals"][0]["end"] == 1
@@ -82,3 +76,12 @@ def test_static_meta_curves_frame_image_and_safe_errors(tmp_path):
         assert _request(base, "/api/episode/0/img/not-a-camera/0")[0] == 404
         assert _request(base, "/missing")[0] == 404
     assert extras.read_bytes() == before
+
+
+def test_jpeg_image_endpoint(tmp_path):
+    root = write_value_viz_run(tmp_path, image_format="jpeg")
+    with _serve(root) as base:
+        status, image = _request(base, "/api/episode/0/img/third_person/1")
+
+    assert status == 200
+    assert image.startswith(b"\xff\xd8")

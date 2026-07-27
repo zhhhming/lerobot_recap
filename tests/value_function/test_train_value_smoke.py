@@ -146,6 +146,7 @@ def _training_config(root: Path, output: Path) -> ValueTrainingConfig:
         batch_size=2,
         learning_rate=1e-3,
         device="cpu",
+        progress=False,
         augmentation=ValueAugmentationConfig(enabled=False),
     )
 
@@ -161,6 +162,7 @@ def test_two_step_training_writes_complete_artifacts_and_metrics(tmp_path):
     assert summary["val_frames"] == 4
     for filename in (
         "checkpoint.pt",
+        "checkpoints/checkpoint_epoch_001.pt",
         "config.json",
         "value_function_meta.json",
         "train_metrics.jsonl",
@@ -176,6 +178,45 @@ def test_two_step_training_writes_complete_artifacts_and_metrics(tmp_path):
     assert "subtask_accuracy" in metrics["val"]
     assert "monotonic_violation_rate" in metrics["val"]
     assert "subtask:pick" in metrics["val"]["clip_rate"]
+
+
+def test_training_preserves_one_checkpoint_per_epoch_and_latest_alias(tmp_path):
+    root = _make_training_run(tmp_path)
+    output = tmp_path / "output"
+    config = _training_config(root, output)
+    config.max_steps = None
+
+    summary = train_value_function(config, model_factory=_model_factory)
+
+    epoch_checkpoints = [
+        output / "checkpoints" / f"checkpoint_epoch_{epoch:03d}.pt"
+        for epoch in range(1, 4)
+    ]
+    assert summary["epoch_checkpoints"] == [str(path) for path in epoch_checkpoints]
+    assert all(path.is_file() for path in epoch_checkpoints)
+    for epoch, path in enumerate(epoch_checkpoints, start=1):
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        assert payload["epoch"] == epoch
+    latest = torch.load(output / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert latest["epoch"] == 3
+    assert (output / "checkpoint.pt").stat().st_ino == epoch_checkpoints[-1].stat().st_ino
+
+
+def test_training_progress_reports_train_validation_and_epoch_summary(tmp_path, capsys):
+    root = _make_training_run(tmp_path)
+    config = _training_config(root, tmp_path / "output")
+    config.max_steps = 1
+    config.progress = True
+    config.log_every_steps = 1
+
+    train_value_function(config, model_factory=_model_factory)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "Epoch 1/3 train" in output
+    assert "Epoch 1/3 val" in output
+    assert "Epoch 1/3 complete" in output
+    assert "loss=" in output
 
 
 def test_checkpoint_reload_preserves_config_state_stats_and_output_shapes(tmp_path):

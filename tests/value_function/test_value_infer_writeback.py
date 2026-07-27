@@ -241,7 +241,7 @@ def test_monotonic_viterbi_rejects_impossible_and_nonfinite_inputs():
         monotonic_viterbi(np.asarray([[0.0, np.nan], [0.0, 0.0]]))
 
 
-def test_both_mode_writes_atomic_paired_predictions_and_provenance(tmp_path):
+def test_both_mode_writes_atomic_paired_predictions_and_provenance(tmp_path, capsys):
     root = _make_raw_run(tmp_path)
     checkpoint = _write_checkpoint(root, tmp_path / "checkpoint.pt")
 
@@ -252,10 +252,14 @@ def test_both_mode_writes_atomic_paired_predictions_and_provenance(tmp_path):
             mode="both",
             batch_size=3,
             device="cpu",
+            progress=True,
         ),
         model_factory=_factory,
     )
 
+    captured = capsys.readouterr()
+    assert "Value inference" in captured.err
+    assert "8/8" in captured.err
     assert summary["prediction_source"] == PREDICTION_SOURCE_MODEL
     assert summary["synthetic"] is False
     assert summary["episodes"] == 2

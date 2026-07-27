@@ -16,6 +16,7 @@ import torch
 
 from lerobot.datasets.feature_utils import build_dataset_frame
 from lerobot.datasets.subtask_timing import SubtaskSequenceContract
+from lerobot.inference_engines.memory_progress_assist import NeroEggMemoryProgressAssist
 from lerobot.inference_engines.subtask_time_tracker import (
     SubtaskTimeTracker,
     SubtaskTimeTrackerSnapshot,
@@ -54,6 +55,7 @@ class RTCInferenceEngine(InferenceEngine):
         subtask_sequence_contract: SubtaskSequenceContract | None = None,
         subtask_time_enabled: bool = False,
         subtask_time_clock: Callable[[], float] = time.monotonic,
+        memory_progress_assist: NeroEggMemoryProgressAssist | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -95,6 +97,11 @@ class RTCInferenceEngine(InferenceEngine):
         self._last_memory_input_text = ""
         self._last_subtask_output_text = ""
         self._memory_source_inference_id: int | None = None
+        if memory_progress_assist is not None and not self._memory_updates_enabled:
+            raise ValueError(
+                "memory_progress_assist requires deployment memory updates to be enabled"
+            )
+        self._memory_progress_assist = memory_progress_assist
 
         self._subtask_time_enabled = bool(subtask_time_enabled)
         if self._subtask_time_enabled and subtask_sequence_contract is None:
@@ -238,6 +245,7 @@ class RTCInferenceEngine(InferenceEngine):
                 "last_memory_input_text": self._last_memory_input_text,
                 "last_subtask_output_text": self._last_subtask_output_text,
                 "memory_source_inference_id": self._memory_source_inference_id,
+                **self._memory_progress_assist_debug_fields(),
                 **self._subtask_time_debug_fields(subtask_time),
             }
 
@@ -247,6 +255,30 @@ class RTCInferenceEngine(InferenceEngine):
         self._last_memory_input_text = ""
         self._last_subtask_output_text = ""
         self._memory_source_inference_id = None
+        if self._memory_progress_assist is not None:
+            self._memory_progress_assist.reset()
+
+    def _memory_progress_assist_debug_fields(self) -> dict[str, Any]:
+        if self._memory_progress_assist is None:
+            return {
+                "memory_progress_assist_enabled": False,
+                "memory_progress_assist_subtask": None,
+                "memory_progress_assist_raw_progress": None,
+                "memory_progress_assist_effective_progress": None,
+                "memory_progress_assist_reason": "disabled",
+                "memory_progress_assist_adjusted": False,
+                "memory_progress_assist_forced": False,
+            }
+        result = self._memory_progress_assist.last_result
+        return {
+            "memory_progress_assist_enabled": True,
+            "memory_progress_assist_subtask": result.subtask_name,
+            "memory_progress_assist_raw_progress": result.raw_progress,
+            "memory_progress_assist_effective_progress": result.effective_progress,
+            "memory_progress_assist_reason": result.reason,
+            "memory_progress_assist_adjusted": result.adjusted,
+            "memory_progress_assist_forced": result.forced,
+        }
 
     def _clear_subtask_time_state_locked(self) -> None:
         """Clear elapsed-time semantic state while holding ``_state_lock``."""
@@ -506,6 +538,26 @@ class RTCInferenceEngine(InferenceEngine):
                         next_memory = (
                             subtask_output_candidate if self._memory_updates_enabled else ""
                         )
+                        if self._memory_progress_assist is not None:
+                            assist_result = self._memory_progress_assist.apply(next_memory)
+                            next_memory = assist_result.text
+                            if assist_result.forced:
+                                logger.warning(
+                                    "Nero egg memory progress assist forced progress: "
+                                    "subtask=%s raw=%.1f effective=%.1f",
+                                    assist_result.subtask_name,
+                                    assist_result.raw_progress,
+                                    assist_result.effective_progress,
+                                )
+                            elif assist_result.adjusted:
+                                logger.debug(
+                                    "Nero egg memory progress assist preserved progress: "
+                                    "subtask=%s raw=%.1f effective=%.1f reason=%s",
+                                    assist_result.subtask_name,
+                                    assist_result.raw_progress,
+                                    assist_result.effective_progress,
+                                    assist_result.reason,
+                                )
                         self._memory_text_for_next_inference = next_memory
                         self._memory_source_inference_id = (
                             committed_inference_id if next_memory else None

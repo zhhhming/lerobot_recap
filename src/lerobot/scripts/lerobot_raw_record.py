@@ -14,7 +14,7 @@ Layout:
             info.json             # per-episode metadata
             frames.parquet        # per-frame scalar features
             events.jsonl          # source switches, subtask markers, pauses
-            <cam_key>/000000.png  # one folder per camera
+            <cam_key>/000000.jpg  # one folder per camera (PNG for legacy runs)
         ep_000001/ ...
 
 This script reuses the control loop, state machine, and action sources from
@@ -32,7 +32,6 @@ os.environ["NO_PROXY"] = _no_proxy
 
 import json
 import logging
-import math
 import shutil
 import time
 from collections import deque
@@ -41,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from pprint import pformat
 from threading import Event
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -58,11 +57,38 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.image_writer import AsyncImageWriter
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.raw_media import (
+    RAW_FORMAT_VERSION,
+    RawImageEncoding,
+    RawImageFormat,
+    camera_subdir_name,
+    make_raw_image_encoding,
+    raw_frame_image_path,
+    raw_image_encoding_from_meta,
+    validate_raw_format_version,
+)
 from lerobot.inference_engines.robot_wrapper import ThreadSafeRobot
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.rtc import ActionInterpolator, RTCConfig
 from lerobot.processor import make_default_processors
-from lerobot.robots import RobotConfig, make_robot_from_config
+
+# Import config modules so draccus can resolve --robot.type / --teleop.type.
+from lerobot.robots import (  # noqa: F401,E402
+    RobotConfig,
+    bi_nero_follower,
+    bi_openarm_follower,
+    bi_so_follower,
+    earthrover_mini_plus,
+    hope_jr,
+    koch_follower,
+    make_robot_from_config,
+    nero_follower,
+    omx_follower,
+    openarm_follower,
+    reachy2,
+    so_follower,
+    unitree_g1 as unitree_g1_robot,
+)
 from lerobot.scripts.lerobot_hil_record import (
     ActionSmoother,
     ControlMode,
@@ -86,34 +112,14 @@ from lerobot.scripts.lerobot_policy_deploy import (
     _load_policy_from_model_dir,
     _start_homing,
 )
-from lerobot.teleoperators import TeleoperatorConfig, make_teleoperator_from_config
-from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
-from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import init_logging, log_say
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-
-# Import config modules so draccus can resolve --robot.type / --teleop.type.
-from lerobot.robots import (  # noqa: F401,E402
-    bi_nero_follower,
-    bi_openarm_follower,
-    bi_so_follower,
-    earthrover_mini_plus,
-    hope_jr,
-    koch_follower,
-    nero_follower,
-    omx_follower,
-    openarm_follower,
-    reachy2,
-    so_follower,
-    unitree_g1 as unitree_g1_robot,
-)
 from lerobot.teleoperators import (  # noqa: F401,E402
+    TeleoperatorConfig,
     bi_openarm_leader,
     bi_pico_nero_teleop,
     bi_so_leader,
     homunculus,
     koch_leader,
+    make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
     openarm_mini,
@@ -122,11 +128,15 @@ from lerobot.teleoperators import (  # noqa: F401,E402
     so_leader,
     unitree_g1,
 )
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.utils import init_logging, log_say
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 logger = logging.getLogger(__name__)
 
 
-RAW_FORMAT_VERSION = 1
 RUN_META_FILENAME = "run_meta.json"
 EP_DIR_PATTERN = "ep_{:06d}"
 
@@ -144,13 +154,20 @@ class RawRecordDatasetConfig:
     force: bool = False
     num_image_writer_processes: int = 0
     num_image_writer_threads_per_camera: int = 4
+    image_format: RawImageFormat = "jpeg"
+    jpeg_quality: int = 95
+    jpeg_subsampling: int = 0
     png_compress_level: int = 3
 
     def __post_init__(self):
         if self.single_task is None:
             raise ValueError("You need to provide --dataset.single_task.")
-        if self.png_compress_level < 0 or self.png_compress_level > 9:
-            raise ValueError("--dataset.png_compress_level must be in [0, 9].")
+        make_raw_image_encoding(
+            self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            jpeg_subsampling=self.jpeg_subsampling,
+            png_compress_level=self.png_compress_level,
+        )
 
 
 @dataclass
@@ -216,7 +233,7 @@ def _resolve_raw_root(repo_id: str, root: str | Path | None) -> Path:
 
 def _camera_subdir_name(image_key: str) -> str:
     """observation.images.cam_top -> cam_top."""
-    return image_key.split(".")[-1]
+    return camera_subdir_name(image_key)
 
 
 def _serialize_features(features: dict) -> dict:
@@ -257,6 +274,7 @@ class RawRun:
         task: str,
         robot_type: str,
         run_config: dict,
+        image_encoding: RawImageEncoding,
     ) -> None:
         self.root = Path(root)
         self.features = features
@@ -264,6 +282,7 @@ class RawRun:
         self.task = task
         self.robot_type = robot_type
         self.run_config = run_config
+        self.image_encoding = image_encoding
 
         self.image_keys = [k for k, v in features.items() if v["dtype"] in ("image", "video")]
         self.scalar_keys = [k for k, v in features.items() if v["dtype"] not in ("image", "video")]
@@ -278,6 +297,7 @@ class RawRun:
         task: str,
         robot_type: str,
         run_config: dict,
+        image_encoding: RawImageEncoding,
     ) -> "RawRun":
         if root.exists() and any(root.iterdir()):
             raise FileExistsError(
@@ -291,12 +311,13 @@ class RawRun:
             "task": task,
             "robot_type": robot_type,
             "features": _serialize_features(features),
+            "image_encoding": image_encoding.to_metadata(),
             "run_config": run_config,
             "created_at": _iso_now(),
         }
         with open(root / RUN_META_FILENAME, "w") as f:
             json.dump(meta, f, indent=2)
-        return cls(root, features, fps, task, robot_type, run_config)
+        return cls(root, features, fps, task, robot_type, run_config, image_encoding)
 
     @classmethod
     def resume(cls, root: Path) -> "RawRun":
@@ -305,11 +326,7 @@ class RawRun:
             raise FileNotFoundError(f"No {RUN_META_FILENAME} in '{root}'; cannot resume.")
         with open(meta_path) as f:
             meta = json.load(f)
-        if meta.get("version") != RAW_FORMAT_VERSION:
-            raise ValueError(
-                f"Raw format version mismatch in '{root}': expected {RAW_FORMAT_VERSION}, "
-                f"got {meta.get('version')}."
-            )
+        validate_raw_format_version(meta, root)
         return cls(
             root=root,
             features=_deserialize_features(meta["features"]),
@@ -317,14 +334,13 @@ class RawRun:
             task=meta["task"],
             robot_type=meta["robot_type"],
             run_config=meta.get("run_config", {}),
+            image_encoding=raw_image_encoding_from_meta(meta),
         )
 
     def _scan_existing_episodes(self) -> int:
         if not self.root.exists():
             return 0
-        existing = sorted(
-            d.name for d in self.root.iterdir() if d.is_dir() and d.name.startswith("ep_")
-        )
+        existing = sorted(d.name for d in self.root.iterdir() if d.is_dir() and d.name.startswith("ep_"))
         if not existing:
             return 0
         last = existing[-1]
@@ -351,7 +367,7 @@ class RawRun:
 
 
 class RawEpisodeRecorder:
-    """Per-episode recorder writing PNG frames and parquet rows."""
+    """Per-episode recorder writing independently addressable image frames and parquet rows."""
 
     def __init__(
         self,
@@ -359,14 +375,12 @@ class RawEpisodeRecorder:
         display_data: bool,
         display_compressed_images: bool,
         image_writer: AsyncImageWriter | None,
-        png_compress_level: int,
         timer: LoopTimer | None = None,
     ) -> None:
         self._run = run
         self._display_data = display_data
         self._display_compressed_images = display_compressed_images
         self._image_writer = image_writer
-        self._png_compress_level = png_compress_level
         self._timer = timer
 
         self._episode_dir: Path | None = None
@@ -428,22 +442,24 @@ class RawEpisodeRecorder:
             obs_frame = build_dataset_frame(self._run.features, obs_processed, prefix=OBS_STR)
             action_frame = build_dataset_frame(self._run.features, robot_action, prefix=ACTION)
 
-        with self._time("rec_save_png"):
+        with self._time("rec_save_image"):
             for cam_key in self._run.image_keys:
                 if cam_key not in obs_frame:
                     continue
                 img = obs_frame[cam_key]
-                fpath = (
-                    self._episode_dir
-                    / _camera_subdir_name(cam_key)
-                    / f"{frame_index:06d}.png"
+                fpath = raw_frame_image_path(
+                    self._episode_dir,
+                    _camera_subdir_name(cam_key),
+                    frame_index,
+                    self._run.image_encoding,
                 )
+                save_kwargs = self._run.image_encoding.pillow_save_kwargs()
                 if self._image_writer is not None:
-                    self._image_writer.save_image(img, fpath, compress_level=self._png_compress_level)
+                    self._image_writer.save_image(img, fpath, **save_kwargs)
                 else:
                     from lerobot.datasets.image_writer import write_image
 
-                    write_image(img, fpath, compress_level=self._png_compress_level)
+                    write_image(img, fpath, **save_kwargs)
 
         row: dict[str, Any] = {
             "frame_index": frame_index,
@@ -528,9 +544,7 @@ class RawEpisodeRecorder:
     def _write_info_json(self) -> None:
         assert self._episode_dir is not None and self._episode_index is not None
         ended_at_perf = time.perf_counter()
-        duration_s = (
-            ended_at_perf - self._episode_start_perf if self._episode_start_perf is not None else 0.0
-        )
+        duration_s = ended_at_perf - self._episode_start_perf if self._episode_start_perf is not None else 0.0
         source_counts: dict[str, int] = {}
         for row in self._frame_rows:
             source_counts[row["source"]] = source_counts.get(row["source"], 0) + 1
@@ -642,14 +656,15 @@ def raw_record(cfg: RawRecordConfig) -> RawRun:
         if cfg.resume:
             run = RawRun.resume(root)
             if run.fps != cfg.dataset.fps:
-                raise ValueError(
-                    f"Resume fps mismatch: existing={run.fps}, requested={cfg.dataset.fps}"
-                )
+                raise ValueError(f"Resume fps mismatch: existing={run.fps}, requested={cfg.dataset.fps}")
             if run.robot_type != robot.name:
-                raise ValueError(
-                    f"Resume robot mismatch: existing={run.robot_type}, requested={robot.name}"
-                )
-            logger.info("Resuming raw run at %s (next episode = %d)", root, run.num_episodes)
+                raise ValueError(f"Resume robot mismatch: existing={run.robot_type}, requested={robot.name}")
+            logger.info(
+                "Resuming raw run at %s (next episode = %d, image encoding = %s)",
+                root,
+                run.num_episodes,
+                run.image_encoding.to_metadata(),
+            )
         else:
             if cfg.dataset.force:
                 _remove_root(root, reason="--dataset.force was set")
@@ -662,6 +677,12 @@ def raw_record(cfg: RawRecordConfig) -> RawRun:
                     task=cfg.dataset.single_task,
                     robot_type=robot.name,
                     run_config=run_config,
+                    image_encoding=make_raw_image_encoding(
+                        cfg.dataset.image_format,
+                        jpeg_quality=cfg.dataset.jpeg_quality,
+                        jpeg_subsampling=cfg.dataset.jpeg_subsampling,
+                        png_compress_level=cfg.dataset.png_compress_level,
+                    ),
                 )
                 created_root = run.root
             except Exception:
@@ -736,7 +757,9 @@ def raw_record(cfg: RawRecordConfig) -> RawRun:
             action_keys = _ordered_action_keys(dataset_features)
         sources = {}
         if teleop is not None:
-            sources["teleop"] = TeleopSource("teleop", teleop, teleop_action_processor, robot_action_processor)
+            sources["teleop"] = TeleopSource(
+                "teleop", teleop, teleop_action_processor, robot_action_processor
+            )
             sources["correction"] = TeleopSource(
                 "correction", teleop, teleop_action_processor, robot_action_processor
             )
@@ -757,7 +780,6 @@ def raw_record(cfg: RawRecordConfig) -> RawRun:
             display_data=cfg.display_data,
             display_compressed_images=display_compressed_images,
             image_writer=image_writer,
-            png_compress_level=cfg.dataset.png_compress_level,
             timer=loop_timer,
         )
 

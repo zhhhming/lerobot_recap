@@ -4,6 +4,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from PIL import Image
 
 from lerobot.scripts.lerobot_value_viz import ValueRun, _compressed_intervals, _sample_indices
 from lerobot.value_function.schema import (
@@ -74,17 +75,21 @@ def _columns(frame_count: int = 8) -> dict[str, pa.Array]:
         VALUE_SUBTASK_REMAINING_NORM_PRED_SMOOTH_HEAD: pa.array(
             [(value + 0.2) / 4 for value in subtask_remaining], type=pa.float32()
         ),
-        VALUE_SUBTASK_ELAPSED_FRAMES_GT: pa.array(
-            [0, 1, 2, 0, 1, 2, 3, 4][:frame_count], type=pa.float32()
-        ),
+        VALUE_SUBTASK_ELAPSED_FRAMES_GT: pa.array([0, 1, 2, 0, 1, 2, 3, 4][:frame_count], type=pa.float32()),
         VALUE_SUBTASK_ELAPSED_NORM_GT: pa.array(
             [0, 0.25, 0.5, 0, 0.25, 0.5, 0.75, 1][:frame_count], type=pa.float32()
         ),
     }
 
 
-def write_value_viz_run(tmp_path: Path, *, complete: bool = True, frame_count: int = 8) -> Path:
-    root = tmp_path / ("complete_run" if complete else "missing_run")
+def write_value_viz_run(
+    tmp_path: Path,
+    *,
+    complete: bool = True,
+    frame_count: int = 8,
+    image_format: str = "png",
+) -> Path:
+    root = tmp_path / (f"complete_run_{image_format}" if complete else f"missing_run_{image_format}")
     root.mkdir()
     features = {
         "action": {"dtype": "float32", "shape": [1], "names": ["a"]},
@@ -97,17 +102,21 @@ def write_value_viz_run(tmp_path: Path, *, complete: bool = True, frame_count: i
             for name in ("left_wrist", "third_person", "right_wrist")
         },
     }
-    (root / "run_meta.json").write_text(
-        json.dumps(
-            {
-                "version": RAW_FORMAT_VERSION,
-                "fps": 20,
-                "task": "value viz test",
-                "robot_type": "bi_nero_follower",
-                "features": features,
-            }
-        )
-    )
+    run_meta = {
+        "version": RAW_FORMAT_VERSION,
+        "fps": 20,
+        "task": "value viz test",
+        "robot_type": "bi_nero_follower",
+        "features": features,
+    }
+    if image_format == "jpeg":
+        run_meta["image_encoding"] = {
+            "format": "jpeg",
+            "extension": ".jpg",
+            "quality": 95,
+            "subsampling": 0,
+        }
+    (root / "run_meta.json").write_text(json.dumps(run_meta))
     for episode_index in range(2):
         episode = root / f"ep_{episode_index:06d}"
         episode.mkdir()
@@ -121,16 +130,27 @@ def write_value_viz_run(tmp_path: Path, *, complete: bool = True, frame_count: i
             ),
             episode / "frames.parquet",
         )
-        columns = _columns(frame_count) if complete else {
-            VALUE_SUBTASK_ID_GT: pa.array([0] * frame_count, type=pa.int32()),
-            VALUE_SUBTASK_NAME_GT: pa.array(["pick"] * frame_count, type=pa.string()),
-        }
+        columns = (
+            _columns(frame_count)
+            if complete
+            else {
+                VALUE_SUBTASK_ID_GT: pa.array([0] * frame_count, type=pa.int32()),
+                VALUE_SUBTASK_NAME_GT: pa.array(["pick"] * frame_count, type=pa.string()),
+            }
+        )
         pq.write_table(pa.table(columns), episode / EXTRAS_FILENAME)
         for camera in ("left_wrist", "third_person", "right_wrist"):
             directory = episode / camera
             directory.mkdir()
             for frame in range(frame_count):
-                (directory / f"{frame:06d}.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+                if image_format == "jpeg":
+                    Image.new("RGB", (8, 8), color=(frame, frame, frame)).save(
+                        directory / f"{frame:06d}.jpg",
+                        quality=95,
+                        subsampling=0,
+                    )
+                else:
+                    (directory / f"{frame:06d}.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
     if complete:
         (root / "value_function_meta.json").write_text(
             json.dumps(
@@ -202,13 +222,17 @@ def test_missing_columns_are_unavailable_not_errors(tmp_path):
     assert meta["provenance"]["global"]["status"] == "missing"
     curves = run.curves(0, unit="norm", boundary="gt")
     assert all(not curve["available"] and curve["points"] == [] for curve in curves["curves"])
-    assert curves["subtask_intervals"] == [
-        {"start": 0, "end": 7, "id": 0, "name": "pick"}
-    ]
+    assert curves["subtask_intervals"] == [{"start": 0, "end": 7, "id": 0, "name": "pick"}]
     assert all(
-        units == {"norm": None, "frames": None}
-        for units in run.frame(0, 0, boundary="gt")["values"].values()
+        units == {"norm": None, "frames": None} for units in run.frame(0, 0, boundary="gt")["values"].values()
     )
+
+
+def test_jpeg_backed_value_run_resolves_jpg_images(tmp_path):
+    run = ValueRun(write_value_viz_run(tmp_path, image_format="jpeg"))
+
+    assert run.image_encoding.mime_type == "image/jpeg"
+    assert run.image_path(0, "third_person", 1).name == "000001.jpg"
 
 
 def test_sampling_is_bounded_and_preserves_endpoints():
@@ -233,12 +257,8 @@ def test_invalid_requests_are_explicit(tmp_path):
 
 
 def test_frontend_has_frame_chart_value_and_keyboard_sync():
-    source = (
-        Path(__file__).parents[2] / "src/lerobot/scripts/value_viz/app.js"
-    ).read_text()
-    set_frame = source.split("async function setFrame", 1)[1].split(
-        "function updateImage", 1
-    )[0]
+    source = (Path(__file__).parents[2] / "src/lerobot/scripts/value_viz/app.js").read_text()
+    set_frame = source.split("async function setFrame", 1)[1].split("function updateImage", 1)[0]
     assert "updateImage()" in set_frame
     assert "/frame/${clamped}" in set_frame
     assert "renderCurrentValues()" in set_frame

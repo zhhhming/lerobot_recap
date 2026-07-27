@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from lerobot.datasets.image_writer import (
     AsyncImageWriter,
@@ -139,6 +139,25 @@ def test_write_image_image(tmp_path, img_factory):
     assert np.array_equal(image_pil, saved_image)
 
 
+def test_write_image_jpeg_quality_and_subsampling(tmp_path, img_array_factory):
+    image_array = img_array_factory()
+    fpath = tmp_path / "test_image.jpg"
+
+    write_image(
+        image_array,
+        fpath,
+        format="JPEG",
+        quality=95,
+        subsampling=0,
+        optimize=False,
+    )
+
+    with Image.open(fpath) as saved_image:
+        assert saved_image.size == (100, 100)
+        assert saved_image.format == "JPEG"
+        assert JpegImagePlugin.get_sampling(saved_image) == 0
+
+
 def test_write_image_exception(tmp_path):
     image_array = "invalid data"
     fpath = tmp_path / DUMMY_IMAGE
@@ -159,6 +178,26 @@ def test_save_image_numpy(tmp_path, img_array_factory):
         assert fpath.exists()
         saved_image = np.array(Image.open(fpath))
         assert np.array_equal(image_array, saved_image)
+    finally:
+        writer.stop()
+
+
+def test_save_image_jpeg_async(tmp_path, img_array_factory):
+    writer = AsyncImageWriter()
+    try:
+        fpath = tmp_path / "async.jpg"
+        writer.save_image(
+            img_array_factory(),
+            fpath,
+            format="JPEG",
+            quality=95,
+            subsampling=0,
+            optimize=False,
+        )
+        writer.wait_until_done()
+        with Image.open(fpath) as saved_image:
+            assert saved_image.format == "JPEG"
+            assert JpegImagePlugin.get_sampling(saved_image) == 0
     finally:
         writer.stop()
 

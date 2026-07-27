@@ -31,6 +31,7 @@ def _make_training_run(
     *,
     fps: int = 30,
     image_keys: tuple[str, ...] = ("observation.images.third_person",),
+    image_format: str = "png",
 ) -> Path:
     root = tmp_path / name
     root.mkdir()
@@ -44,16 +45,21 @@ def _make_training_run(
     }
     for key in image_keys:
         features[key] = {"dtype": "image", "shape": [16, 16, 3], "names": None}
-    _write_json(
-        root / "run_meta.json",
-        {
-            "version": RAW_FORMAT_VERSION,
-            "fps": fps,
-            "task": "test task",
-            "robot_type": "test_robot",
-            "features": features,
-        },
-    )
+    run_meta = {
+        "version": RAW_FORMAT_VERSION,
+        "fps": fps,
+        "task": "test task",
+        "robot_type": "test_robot",
+        "features": features,
+    }
+    if image_format == "jpeg":
+        run_meta["image_encoding"] = {
+            "format": "jpeg",
+            "extension": ".jpg",
+            "quality": 95,
+            "subsampling": 0,
+        }
+    _write_json(root / "run_meta.json", run_meta)
     _write_json(
         root / "annotation_config.json",
         {"subtasks": [{"name": "pick"}, {"name": "place"}]},
@@ -94,7 +100,9 @@ def _make_training_run(
             camera.mkdir()
             for frame in range(len(labels)):
                 pixels = np.full((16, 16, 3), episode_index * 30 + frame * 10, dtype=np.uint8)
-                Image.fromarray(pixels).save(camera / f"{frame:06d}.png")
+                extension = ".jpg" if image_format == "jpeg" else ".png"
+                save_kwargs = {"quality": 95, "subsampling": 0} if image_format == "jpeg" else {}
+                Image.fromarray(pixels).save(camera / f"{frame:06d}{extension}", **save_kwargs)
     prepare_value_targets(
         ValueTargetConfig(
             root=root,
@@ -131,6 +139,21 @@ def test_raw_value_dataset_loads_images_state_targets_and_metadata(tmp_path):
     assert dataset.subtask_order == ("pick", "place")
 
 
+def test_raw_value_dataset_loads_jpeg_backed_run(tmp_path):
+    root = _make_training_run(tmp_path, image_format="jpeg")
+    dataset = RawValueFrameDataset(
+        [root],
+        mode="global",
+        image_keys=("observation.images.third_person",),
+        augmentation=ValueAugmentationConfig(enabled=False),
+    )
+
+    sample = dataset[0]
+
+    assert sample["observation.images.third_person"].shape == (3, 16, 16)
+    assert dataset.contracts[0].image_encoding.extension == ".jpg"
+
+
 def test_episode_split_has_no_frame_leakage_and_state_stats_use_train_only(tmp_path):
     root = _make_training_run(tmp_path)
     dataset = RawValueFrameDataset(
@@ -139,9 +162,7 @@ def test_episode_split_has_no_frame_leakage_and_state_stats_use_train_only(tmp_p
         image_keys=("observation.images.third_person",),
         augmentation=ValueAugmentationConfig(enabled=False),
     )
-    train, val, train_episodes, val_episodes = split_episode_indices(
-        dataset, val_episodes={(0, 1)}
-    )
+    train, val, train_episodes, val_episodes = split_episode_indices(dataset, val_episodes={(0, 1)})
     mean, std = compute_state_statistics(dataset, train)
 
     assert train_episodes == [(0, 0)]
@@ -203,9 +224,7 @@ def test_inactive_leftover_target_columns_are_not_accepted(tmp_path):
     root = _make_training_run(tmp_path)
     # A global-only rerun leaves old subtask columns in extras by design, but the active
     # target-stage manifest must prevent training from consuming them.
-    prepare_value_targets(
-        ValueTargetConfig(root=root, mode="global", num_bins=8, global_scale="max")
-    )
+    prepare_value_targets(ValueTargetConfig(root=root, mode="global", num_bins=8, global_scale="max"))
 
     with pytest.raises(ValueError, match="current target stage does not provide"):
         RawValueFrameDataset(

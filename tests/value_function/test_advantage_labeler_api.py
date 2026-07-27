@@ -7,8 +7,14 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from PIL import Image
 
-from lerobot.scripts.lerobot_advantage_labeler import ChunkCache, Handler, RawRun
+from lerobot.scripts.lerobot_advantage_labeler import (
+    ChunkCache,
+    Handler,
+    RawRun,
+    paginated_preview,
+)
 from lerobot.value_function.advantage_labeling import advantage_columns
 from lerobot.value_function.raw_io import fingerprint_raw_run_columns, update_stage_metadata
 from lerobot.value_function.schema import (
@@ -163,6 +169,62 @@ def test_static_meta_paginated_preview_and_safe_404(tmp_path):
         assert _request(base, "/missing")[0] == 404
 
 
+def test_jpeg_image_endpoint(tmp_path):
+    root = _write_run(tmp_path)
+    metadata_path = root / "run_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["image_encoding"] = {
+        "format": "jpeg",
+        "extension": ".jpg",
+        "quality": 95,
+        "subsampling": 0,
+    }
+    metadata_path.write_text(json.dumps(metadata))
+    camera = root / "ep_000000" / "third_person"
+    camera.mkdir()
+    Image.new("RGB", (8, 8), color=(20, 30, 40)).save(camera / "000001.jpg", quality=95)
+
+    with _serve(root) as (base, _cache):
+        status, image = _request(base, "/api/episode/0/img/third_person/1")
+
+    assert status == 200
+    assert image.startswith(b"\xff\xd8")
+
+
+def test_paginated_preview_reports_page_containing_current_threshold():
+    chunks = [
+        {
+            "key": f"ep_000000:frame_{index:06d}",
+            "episode_index": 0,
+            "frame_index": index,
+            "advantage": float(index),
+            "is_valid": True,
+        }
+        for index in range(20)
+    ]
+
+    descending = paginated_preview(
+        chunks,
+        top_percent=0.5,
+        sort_order="desc",
+        tie_policy="exact_count",
+        overrides={},
+        page_size=5,
+    )
+    ascending = paginated_preview(
+        chunks,
+        top_percent=0.5,
+        sort_order="asc",
+        tie_policy="exact_count",
+        overrides={},
+        page_size=5,
+    )
+
+    assert descending["threshold"]["threshold_value"] == 10.0
+    assert descending["threshold_page"] == 2
+    assert ascending["threshold_page"] == 3
+
+
 def test_preview_validation_and_confirmed_export(tmp_path):
     root = _write_run(tmp_path)
     body = {
@@ -179,6 +241,7 @@ def test_preview_validation_and_confirmed_export(tmp_path):
         assert status == 200
         assert preview["items"][0]["advantage"] < preview["items"][1]["advantage"]
         assert preview["threshold"]["positive_direction"] == "high"
+        assert preview["threshold_page"] is not None
         assert _request(
             base,
             "/api/preview",
@@ -230,5 +293,6 @@ def test_frontend_uses_pagination_debounce_and_local_frame_updates():
 
     assert "page_size: state.pageSize" in source
     assert "debounce(() => refresh({ resetPage: true }), 150)" in source
+    assert "state.page = state.thresholdPage" in source
     assert "renderList" not in select_chunk
     assert "frameImage.src" in select_chunk

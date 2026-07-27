@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.datasets.raw_media import raw_frame_image_path, raw_image_encoding_from_meta
 from lerobot.value_function.raw_io import (
     camera_subdir_name,
     discover_episodes,
@@ -36,12 +37,12 @@ from lerobot.value_function.schema import (
     VALUE_GLOBAL_REMAINING_NORM_GT,
     VALUE_GLOBAL_REMAINING_NORM_PRED,
     VALUE_INFERENCE_STAGE_PREFIX,
+    VALUE_SUBTASK_ELAPSED_FRAMES_GT,
+    VALUE_SUBTASK_ELAPSED_NORM_GT,
     VALUE_SUBTASK_ID_GT,
     VALUE_SUBTASK_ID_PRED_SMOOTH,
     VALUE_SUBTASK_NAME_GT,
     VALUE_SUBTASK_NAME_PRED_SMOOTH,
-    VALUE_SUBTASK_ELAPSED_FRAMES_GT,
-    VALUE_SUBTASK_ELAPSED_NORM_GT,
     VALUE_SUBTASK_REMAINING_FRAMES_GT,
     VALUE_SUBTASK_REMAINING_FRAMES_PRED_GT_HEAD,
     VALUE_SUBTASK_REMAINING_FRAMES_PRED_SMOOTH_HEAD,
@@ -215,6 +216,7 @@ class ValueRun:
     def __init__(self, root: str | Path, *, chunk_size: int = 50) -> None:
         self.root = Path(root).expanduser().resolve()
         self.meta = read_run_meta(self.root)
+        self.image_encoding = raw_image_encoding_from_meta(self.meta)
         self.episodes = discover_episodes(self.root)
         self.episodes_by_index = {episode.index: episode for episode in self.episodes}
         self.fps = int(self.meta.get("fps", 30))
@@ -245,9 +247,7 @@ class ValueRun:
         first_path, first_schema = schemas[0]
         for path, schema in schemas[1:]:
             if schema != first_schema:
-                raise ValueError(
-                    f"extras.parquet schema differs between {first_path} and {path}"
-                )
+                raise ValueError(f"extras.parquet schema differs between {first_path} and {path}")
         if len(schemas) != len(self.episodes):
             raise ValueError("Some episodes have extras.parquet and others do not")
         return set(first_schema.names)
@@ -270,8 +270,7 @@ class ValueRun:
             table = pq.read_table(path)
             if table.num_rows != episode.frame_count:
                 raise ValueError(
-                    f"{path} length ({table.num_rows}) does not match frame count "
-                    f"({episode.frame_count})"
+                    f"{path} length ({table.num_rows}) does not match frame count ({episode.frame_count})"
                 )
             self._cache[index] = (signature, table)
         return self._cache[index][1]
@@ -333,9 +332,7 @@ class ValueRun:
                     "available": available,
                     "id_column": definition["id_column"] if available else None,
                     "name_column": (
-                        definition["name_column"]
-                        if definition["name_column"] in self._schema_names
-                        else None
+                        definition["name_column"] if definition["name_column"] in self._schema_names else None
                     ),
                 }
             )
@@ -347,8 +344,7 @@ class ValueRun:
             "chunk_size": self.chunk_size,
             "cameras": self.cameras,
             "episodes": [
-                {"index": ep.index, "name": ep.path.name, "length": ep.frame_count}
-                for ep in self.episodes
+                {"index": ep.index, "name": ep.path.name, "length": ep.frame_count} for ep in self.episodes
             ],
             "series": available_series,
             "boundaries": boundaries,
@@ -391,9 +387,7 @@ class ValueRun:
                     "column": column if available else None,
                     "available": available,
                     "points": (
-                        [[frame, _safe_number(values[frame])] for frame in indices]
-                        if available
-                        else []
+                        [[frame, _safe_number(values[frame])] for frame in indices] if available else []
                     ),
                 }
             )
@@ -426,9 +420,7 @@ class ValueRun:
                 for unit in ("norm", "frames")
             }
         intervals = self._boundary_intervals(table, boundary)
-        current_interval = next(
-            (item for item in intervals if item["start"] <= frame <= item["end"]), None
-        )
+        current_interval = next((item for item in intervals if item["start"] <= frame <= item["end"]), None)
         return {
             "episode_index": index,
             "frame": frame,
@@ -452,7 +444,7 @@ class ValueRun:
             raise FileNotFoundError(f"Unknown camera: {camera}")
         if frame < 0 or frame >= episode.frame_count:
             raise FileNotFoundError(f"Frame {frame} does not exist in episode {index}")
-        path = episode.path / camera / f"{frame:06d}.png"
+        path = raw_frame_image_path(episode.path, camera, frame, self.image_encoding)
         if not path.is_file():
             raise FileNotFoundError(f"Missing image: {path}")
         return path
@@ -531,10 +523,12 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
             elif match := re.fullmatch(r"/api/episode/(\d+)/img/([^/]+)/(\d+)", path):
-                image_path = self.run.image_path(
-                    int(match.group(1)), match.group(2), int(match.group(3))
+                image_path = self.run.image_path(int(match.group(1)), match.group(2), int(match.group(3)))
+                self._send_bytes(
+                    image_path.read_bytes(),
+                    self.run.image_encoding.mime_type,
+                    cache=True,
                 )
-                self._send_bytes(image_path.read_bytes(), "image/png", cache=True)
             else:
                 self._send_bytes(b"Not found", "text/plain", status=404)
         except CONNECTION_ERRORS:

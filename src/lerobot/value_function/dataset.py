@@ -15,6 +15,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 
+from lerobot.datasets.raw_media import RawImageEncoding, raw_image_encoding_from_meta
 from lerobot.value_function.raw_io import (
     assert_stage_dependencies_current,
     discover_episodes,
@@ -78,6 +79,7 @@ class RawRunValueContract:
     robot_type: str
     fps: float
     image_features: dict[str, dict[str, Any]]
+    image_encoding: RawImageEncoding
     state_key: str
     state_feature: dict[str, Any] | None
     value_mode: str
@@ -145,6 +147,7 @@ def load_raw_run_value_contract(
         robot_type=str(run_meta.get("robot_type", "")),
         fps=float(run_meta.get("fps", 0.0)),
         image_features=image_features,
+        image_encoding=raw_image_encoding_from_meta(run_meta),
         state_key=state_key,
         state_feature=dict(features[state_key]) if state_key in features else None,
         value_mode=str(metadata.get("value_mode", "")),
@@ -154,8 +157,7 @@ def load_raw_run_value_contract(
             float(global_scale["frames"]) if global_scale.get("frames") is not None else None
         ),
         subtask_scale_frames={
-            str(name): float(scale)
-            for name, scale in (subtask_scale.get("frames_by_subtask") or {}).items()
+            str(name): float(scale) for name, scale in (subtask_scale.get("frames_by_subtask") or {}).items()
         },
         global_num_bins=int(metadata.get("global_num_bins", metadata.get("num_bins", 256))),
         subtask_num_bins=int(metadata.get("subtask_num_bins", metadata.get("num_bins", 256))),
@@ -253,9 +255,7 @@ def _state_numpy(frames, state_key: str, expected_dim: int) -> np.ndarray:
         raise ValueError(f"Missing configured state column {state_key!r} in frames.parquet")
     state = np.asarray(frames.column(state_key).to_pylist(), dtype=np.float32)
     if state.ndim != 2 or state.shape[1] != expected_dim:
-        raise ValueError(
-            f"State column {state_key!r} must have shape [N, {expected_dim}], got {state.shape}"
-        )
+        raise ValueError(f"State column {state_key!r} must have shape [N, {expected_dim}], got {state.shape}")
     if not np.isfinite(state).all():
         raise ValueError(f"State column {state_key!r} contains non-finite values")
     return state
@@ -290,9 +290,7 @@ class ValueImageAugmentation:
             ]
             if self.config.gaussian_blur_prob > 0:
                 transforms.append(
-                    v2.RandomApply(
-                        [v2.GaussianBlur(kernel_size=3)], p=self.config.gaussian_blur_prob
-                    )
+                    v2.RandomApply([v2.GaussianBlur(kernel_size=3)], p=self.config.gaussian_blur_prob)
                 )
             if self.config.grayscale_prob > 0:
                 transforms.append(v2.RandomGrayscale(p=self.config.grayscale_prob))
@@ -325,9 +323,7 @@ class RawValueFrameDataset(Dataset):
         if not self.image_keys:
             raise ValueError("image_keys must not be empty")
 
-        self.contracts = tuple(
-            load_raw_run_value_contract(root, state_key=state_key) for root in self.roots
-        )
+        self.contracts = tuple(load_raw_run_value_contract(root, state_key=state_key) for root in self.roots)
         validate_compatible_value_contracts(
             self.contracts,
             mode=mode,
@@ -390,14 +386,9 @@ class RawValueFrameDataset(Dataset):
             if frames.num_rows != extras.num_rows or frames.num_rows != episode.frame_count:
                 raise ValueError(f"Frame/extras length mismatch in {episode.path}")
             targets = {
-                name: _column_numpy(extras, name, dtype=dtype)
-                for name, dtype in self._required_targets()
+                name: _column_numpy(extras, name, dtype=dtype) for name, dtype in self._required_targets()
             }
-            state = (
-                _state_numpy(frames, self.state_key, int(expected_state_dim))
-                if self.use_state
-                else None
-            )
+            state = _state_numpy(frames, self.state_key, int(expected_state_dim)) if self.use_state else None
             progress = (
                 _column_numpy(extras, "subtask_progress", dtype=np.float32)
                 if "subtask_progress" in extras.column_names
@@ -413,9 +404,17 @@ class RawValueFrameDataset(Dataset):
                 )
             else:
                 scales = np.ones(episode.frame_count, dtype=np.float32)
-            paths_by_key = frame_image_paths(episode.path, 0, self.image_keys)
+            paths_by_key = frame_image_paths(
+                episode.path,
+                0,
+                self.image_keys,
+                contract.image_encoding,
+            )
             image_paths = {
-                key: [path.parent / f"{frame_index:06d}.png" for frame_index in range(episode.frame_count)]
+                key: [
+                    path.parent / f"{frame_index:06d}{contract.image_encoding.extension}"
+                    for frame_index in range(episode.frame_count)
+                ]
                 for key, path in paths_by_key.items()
             }
             slot = len(self.episodes)
@@ -451,9 +450,7 @@ class RawValueFrameDataset(Dataset):
         reference = self.references[index]
         episode = self.episodes[reference.episode_slot]
         frame_index = reference.frame_index
-        loaded_images = [
-            self._load_image(episode.image_paths[key][frame_index]) for key in self.image_keys
-        ]
+        loaded_images = [self._load_image(episode.image_paths[key][frame_index]) for key in self.image_keys]
         if augment:
             groups: dict[tuple[int, int], list[int]] = {}
             for image_index, image in enumerate(loaded_images):
@@ -464,9 +461,7 @@ class RawValueFrameDataset(Dataset):
                 )
                 for offset, image_index in enumerate(indices):
                     loaded_images[image_index] = transformed[offset]
-        sample: dict[str, Any] = {
-            key: loaded_images[i] for i, key in enumerate(self.image_keys)
-        }
+        sample: dict[str, Any] = {key: loaded_images[i] for i, key in enumerate(self.image_keys)}
         if episode.state is not None:
             sample[self.state_key] = torch.from_numpy(episode.state[frame_index].copy())
         for name, values in episode.targets.items():
@@ -595,8 +590,7 @@ def training_data_contract(dataset: RawValueFrameDataset) -> dict[str, Any]:
         "fps": dataset.contracts[0].fps,
         "image_keys": list(dataset.image_keys),
         "image_features": {
-            key: _feature_signature(dataset.contracts[0].image_features[key])
-            for key in dataset.image_keys
+            key: _feature_signature(dataset.contracts[0].image_features[key]) for key in dataset.image_keys
         },
         "state_key": dataset.state_key if dataset.use_state else None,
         "state_feature": (
@@ -605,8 +599,6 @@ def training_data_contract(dataset: RawValueFrameDataset) -> dict[str, Any]:
         "subtask_order": list(dataset.subtask_order),
         "global_scale_frames": dataset.contracts[0].global_scale_frames,
         "subtask_scale_frames": dataset.contracts[0].subtask_scale_frames,
-        "target_stage_fingerprints": [
-            contract.target_stage_fingerprint for contract in dataset.contracts
-        ],
+        "target_stage_fingerprints": [contract.target_stage_fingerprint for contract in dataset.contracts],
         "target_output_columns": list(dataset.contracts[0].target_output_columns),
     }

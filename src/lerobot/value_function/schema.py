@@ -1,6 +1,6 @@
 """Shared names for value-function raw dataset artifacts."""
 
-RAW_FORMAT_VERSION = 1
+from lerobot.datasets.raw_media import RAW_FORMAT_VERSION
 PIPELINE_SCHEMA_VERSION = 2
 
 TARGET_STAGE = "targets"

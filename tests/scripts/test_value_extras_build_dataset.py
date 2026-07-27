@@ -1,9 +1,11 @@
 import json
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+from PIL import Image
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.factory import resolve_delta_timestamps
@@ -60,47 +62,53 @@ def _write_stage(root, name, *, inputs, outputs, dependencies=()):
     )
 
 
-def _make_raw_run(tmp_path, *, with_metadata=True, episode_count=1):
+def _make_raw_run(tmp_path, *, with_metadata=True, episode_count=1, jpeg_images=False):
     root = tmp_path / "raw"
     root.mkdir(parents=True)
-    (root / "run_meta.json").write_text(
-        json.dumps(
-            {
-                "version": RAW_FORMAT_VERSION,
-                "fps": 10,
-                "task": "integration test",
-                "robot_type": "test_robot",
-                "features": {
-                    "action": {
-                        "dtype": "float32",
-                        "shape": [2],
-                        "names": ["a0", "a1"],
-                    },
-                    "observation.state": {
-                        "dtype": "float32",
-                        "shape": [2],
-                        "names": ["s0", "s1"],
-                    },
-                },
-            }
-        )
-    )
+    features = {
+        "action": {
+            "dtype": "float32",
+            "shape": [2],
+            "names": ["a0", "a1"],
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [2],
+            "names": ["s0", "s1"],
+        },
+    }
+    if jpeg_images:
+        features["observation.images.third_person"] = {
+            "dtype": "video",
+            "shape": [12, 16, 3],
+            "names": ["height", "width", "channels"],
+        }
+    run_meta = {
+        "version": RAW_FORMAT_VERSION,
+        "fps": 10,
+        "task": "integration test",
+        "robot_type": "test_robot",
+        "features": features,
+    }
+    if jpeg_images:
+        run_meta["image_encoding"] = {
+            "format": "jpeg",
+            "extension": ".jpg",
+            "quality": 95,
+            "subsampling": 0,
+        }
+    (root / "run_meta.json").write_text(json.dumps(run_meta))
     for episode_index in range(episode_count):
         length = 6
         episode = root / f"ep_{episode_index:06d}"
         episode.mkdir()
-        (episode / "info.json").write_text(
-            json.dumps({"length": length, "task": "integration test"})
-        )
+        (episode / "info.json").write_text(json.dumps({"length": length, "task": "integration test"}))
         pq.write_table(
             pa.table(
                 {
                     "frame_index": pa.array(range(length), type=pa.int64()),
                     "action": pa.array(
-                        [
-                            [float(i + episode_index * length), float(i) + 0.25]
-                            for i in range(length)
-                        ],
+                        [[float(i + episode_index * length), float(i) + 0.25] for i in range(length)],
                         type=pa.list_(pa.float32(), 2),
                     ),
                     "observation.state": pa.array(
@@ -119,9 +127,7 @@ def _make_raw_run(tmp_path, *, with_metadata=True, episode_count=1):
                         type=pa.string(),
                     ),
                     ADVANTAGE_GROUP_ID_GLOBAL: pa.array(["global:bin:+00001"] * length),
-                    ADVANTAGE_LOSS_WEIGHT_GLOBAL: pa.array(
-                        [2.0, 1.0, 0.5, 1.0, 0.0, 0.0], type=pa.float32()
-                    ),
+                    ADVANTAGE_LOSS_WEIGHT_GLOBAL: pa.array([2.0, 1.0, 0.5, 1.0, 0.0, 0.0], type=pa.float32()),
                     ADVANTAGE_GLOBAL_IS_VALID: pa.array(
                         [True, True, True, True, False, False], type=pa.bool_()
                     ),
@@ -132,6 +138,12 @@ def _make_raw_run(tmp_path, *, with_metadata=True, episode_count=1):
             ),
             episode / "extras.parquet",
         )
+        if jpeg_images:
+            camera = episode / "third_person"
+            camera.mkdir()
+            for frame in range(length):
+                pixels = np.full((12, 16, 3), 30 + frame, dtype=np.uint8)
+                Image.fromarray(pixels).save(camera / f"{frame:06d}.jpg", quality=95, subsampling=0)
     if with_metadata:
         _write_stage(
             root,
@@ -161,9 +173,7 @@ def _build(root, output_root, *, exclude_features=""):
     )
 
 
-def test_build_dataset_item_dataloader_pi0_preprocessor_and_action_chunk(
-    tmp_path, monkeypatch
-):
+def test_build_dataset_item_dataloader_pi0_preprocessor_and_action_chunk(tmp_path, monkeypatch):
     root = _make_raw_run(tmp_path)
     output_root = tmp_path / "dataset"
     dataset = _build(root, output_root)
@@ -180,9 +190,7 @@ def test_build_dataset_item_dataloader_pi0_preprocessor_and_action_chunk(
         device="cpu",
         use_advantage_conditioning=True,
     )
-    config.input_features = {
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,))
-    }
+    config.input_features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,))}
     config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
     delta_timestamps = resolve_delta_timestamps(config, dataset.meta)
     reloaded = LeRobotDataset(
@@ -228,6 +236,48 @@ def test_build_include_exclude_keeps_training_fields_and_drops_debug(tmp_path):
     assert ADVANTAGE_LOSS_WEIGHT_GLOBAL in dataset.features
     assert VALUE_GLOBAL_REMAINING_NORM_PRED not in dataset.features
     assert ADVANTAGE_GLOBAL_IS_VALID not in dataset.features
+
+
+def test_build_dataset_filters_raw_episode_indices(tmp_path):
+    root = _make_raw_run(tmp_path, episode_count=3)
+    dataset = build_dataset(
+        BuildDatasetConfig(
+            runs=[str(root)],
+            episode_indices=[1],
+            output_repo_id="test/value-extras-filtered",
+            output_root=str(tmp_path / "filtered-dataset"),
+            video=False,
+        )
+    )
+
+    assert dataset is not None
+    assert dataset.num_episodes == 1
+    assert dataset.num_frames == 6
+    assert dataset[0]["action"][0].item() == pytest.approx(6.0)
+
+
+def test_build_dataset_rejects_missing_raw_episode_indices(tmp_path):
+    root = _make_raw_run(tmp_path, episode_count=2)
+    with pytest.raises(ValueError, match=r"not found: \[7\]"):
+        build_dataset(
+            BuildDatasetConfig(
+                runs=[str(root)],
+                episode_indices=[7],
+                output_repo_id="test/value-extras-missing-episode",
+                output_root=str(tmp_path / "missing-episode-dataset"),
+                video=False,
+            )
+        )
+
+
+def test_build_dataset_reads_jpeg_backed_raw_images(tmp_path):
+    root = _make_raw_run(tmp_path, jpeg_images=True)
+
+    dataset = _build(root, tmp_path / "jpeg-dataset")
+
+    assert dataset is not None
+    image = dataset[0]["observation.images.third_person"]
+    assert image.shape == (3, 12, 16)
 
 
 def test_build_rejects_missing_and_stale_pipeline_metadata(tmp_path):

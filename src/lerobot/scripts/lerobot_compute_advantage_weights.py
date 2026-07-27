@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from lerobot.datasets.raw_media import raw_frame_image_path, raw_image_encoding_from_meta
 from lerobot.value_function.advantage_weights import (
     AdvantageWeightConfig,
     compute_advantage_weights,
@@ -38,6 +39,7 @@ class RawRun:
         self.meta = read_run_meta(self.root)
         self.fps = int(self.meta.get("fps", 30))
         self.task = self.meta.get("task", "")
+        self.image_encoding = raw_image_encoding_from_meta(self.meta)
         self.image_keys = get_image_keys(self.meta)
         self.cam_subdir = {key: key.split(".")[-1] for key in self.image_keys}
 
@@ -263,10 +265,15 @@ class Handler(BaseHTTPRequestHandler):
     def _api_image(self, episode: int, camera: str, frame: int):
         if camera not in set(self.run.cam_subdir.values()):
             raise FileNotFoundError(f"Unknown camera: {camera}")
-        path = self.run.episode_dir(episode) / camera / f"{frame:06d}.png"
+        path = raw_frame_image_path(
+            self.run.episode_dir(episode),
+            camera,
+            frame,
+            self.run.image_encoding,
+        )
         if not path.is_file():
             raise FileNotFoundError(f"Image not found: {path}")
-        self._send_bytes(path.read_bytes(), "image/png", cache=True)
+        self._send_bytes(path.read_bytes(), self.run.image_encoding.mime_type, cache=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

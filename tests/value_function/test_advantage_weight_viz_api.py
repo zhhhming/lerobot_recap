@@ -6,6 +6,8 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 
+from PIL import Image
+
 from lerobot.scripts.lerobot_compute_advantage_weights import Handler, RawRun, WeightCache
 from lerobot.value_function.advantage_weights import AdvantageWeightConfig, compute_advantage_weights
 from tests.value_function.test_advantage_weights import _write_run
@@ -75,6 +77,28 @@ def test_static_meta_groups_chunks_cache_and_clear_image_404(tmp_path):
         status, missing = _request(base, "/api/episode/0/img/third_person/0")
         assert status == 404
         assert "Image not found" in missing["error"]
+
+
+def test_jpeg_image_endpoint(tmp_path):
+    root = _weighted_run(tmp_path)
+    metadata_path = root / "run_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["image_encoding"] = {
+        "format": "jpeg",
+        "extension": ".jpg",
+        "quality": 95,
+        "subsampling": 0,
+    }
+    metadata_path.write_text(json.dumps(metadata))
+    camera = root / "ep_000000" / "third_person"
+    camera.mkdir()
+    Image.new("RGB", (8, 8), color=(20, 30, 40)).save(camera / "000000.jpg", quality=95)
+
+    with _serve(root) as (base, _cache):
+        status, image = _request(base, "/api/episode/0/img/third_person/0")
+
+    assert status == 200
+    assert image.startswith(b"\xff\xd8")
 
 
 def test_fifty_thousand_chunks_are_paginated(tmp_path):

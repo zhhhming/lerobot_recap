@@ -316,10 +316,10 @@ class PaliGemmaValueBackbone(nn.Module):
         return image
 
     @staticmethod
-    def _attention_mask_4d(pad_masks: Tensor) -> Tensor:
+    def _attention_mask_4d(pad_masks: Tensor, *, dtype: torch.dtype) -> Tensor:
         prefix_blocks = torch.zeros_like(pad_masks, dtype=torch.bool)
         attention = make_att_2d_masks(pad_masks, prefix_blocks)[:, None, :, :]
-        return torch.where(attention, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        return torch.where(attention, 0.0, OPENPI_ATTENTION_MASK_VALUE).to(dtype=dtype)
 
     def forward(self, batch: dict[str, Any]) -> Tensor:
         device = next(self.parameters()).device
@@ -348,7 +348,7 @@ class PaliGemmaValueBackbone(nn.Module):
         lm_dtype = next(self.language_model.layers.parameters()).dtype
         hidden = self.language_model(
             inputs_embeds=tokens.to(lm_dtype),
-            attention_mask=self._attention_mask_4d(pad_masks),
+            attention_mask=self._attention_mask_4d(pad_masks, dtype=lm_dtype),
             position_ids=position_ids,
             use_cache=False,
         ).last_hidden_state

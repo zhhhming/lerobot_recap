@@ -40,6 +40,7 @@ from lerobot.datasets.subtask_timing import (
 )
 from lerobot.datasets.utils import DEFAULT_FEATURES
 from lerobot.inference_engines import RTCInferenceEngine
+from lerobot.inference_engines.memory_progress_assist import NeroEggMemoryProgressAssist
 from lerobot.inference_engines.robot_wrapper import ThreadSafeRobot
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc import ActionInterpolator, RTCConfig
@@ -75,6 +76,8 @@ logger = logging.getLogger(__name__)
 
 
 DeployState = Literal["paused", "preparing", "running", "homing"]
+_DEPLOY_DATASET_ANNOTATION_FEATURES = frozenset({"subtask", "subtask_progress"})
+_NERO_EGG_DATASET_REPO_ID = "ming326/nero_egg_subtask"
 
 
 @dataclass
@@ -112,6 +115,7 @@ class PolicyDeployConfig:
     play_sounds: bool = True
     use_subtask_time_conditioning: bool | None = None
     subtask_time_deployment_margin_seconds: float = 5.0
+    nero_egg_memory_progress_assist: bool = True
     status_display: Literal["auto", "live", "plain"] = "auto"
     status_refresh_hz: float = 4.0
 
@@ -142,6 +146,8 @@ class PolicyDeployConfig:
         _validate_subtask_time_deployment_margin(self.subtask_time_deployment_margin_seconds)
         if self.use_subtask_time_conditioning not in (None, False, True):
             raise ValueError("--use_subtask_time_conditioning must be true, false, or omitted.")
+        if not isinstance(self.nero_egg_memory_progress_assist, bool):
+            raise ValueError("--nero_egg_memory_progress_assist must be true or false.")
         if self.status_display not in ("auto", "live", "plain"):
             raise ValueError("--status_display must be one of: auto, live, plain.")
         if not math.isfinite(self.status_refresh_hz) or self.status_refresh_hz <= 0:
@@ -239,6 +245,39 @@ def _load_subtask_time_sequence_contract(
         margin,
     )
     return contract
+
+
+def _make_nero_egg_memory_progress_assist(
+    dataset_cfg,
+    policy_cfg,
+    *,
+    enabled: bool,
+) -> NeroEggMemoryProgressAssist | None:
+    """Enable the targeted deployment assist only for the known nero egg dataset."""
+    repo_id = getattr(dataset_cfg, "repo_id", None)
+    is_nero_egg = (
+        isinstance(repo_id, str)
+        and repo_id.strip().casefold() == _NERO_EGG_DATASET_REPO_ID.casefold()
+    )
+    if not enabled or not is_nero_egg:
+        return None
+
+    memory_enabled = bool(getattr(policy_cfg, "use_memory_conditioning", False))
+    memory_updates_enabled = memory_enabled and bool(
+        getattr(policy_cfg, "subtask_generate_at_inference", True)
+    )
+    if not memory_updates_enabled:
+        logger.warning(
+            "Nero egg memory progress assist requested but checkpoint deployment memory "
+            "updates are disabled; assist will remain disabled."
+        )
+        return None
+
+    logger.info(
+        "Enabled nero egg memory progress assist: stirring 0.6 advances to 0.7 "
+        "after a 6.0s stall; frying 0.7 advances to 0.8 after a 6.0s stall."
+    )
+    return NeroEggMemoryProgressAssist()
 
 
 class KeyboardEvents:
@@ -528,10 +567,15 @@ def _resolve_control_rate(dataset_fps: int, cfg: PolicyDeployConfig) -> tuple[fl
 def _check_metadata_compatibility(
     dataset_meta: LeRobotDatasetMetadata, robot_type: str, dataset_fps: int, runtime_features: dict
 ) -> None:
+    dataset_runtime_features = {
+        key: value
+        for key, value in dataset_meta.features.items()
+        if key not in _DEPLOY_DATASET_ANNOTATION_FEATURES
+    }
     fields = [
         ("robot_type", dataset_meta.robot_type, robot_type),
         ("fps", dataset_meta.fps, dataset_fps),
-        ("features", dataset_meta.features, {**runtime_features, **DEFAULT_FEATURES}),
+        ("features", dataset_runtime_features, {**runtime_features, **DEFAULT_FEATURES}),
     ]
     mismatches = []
     for field, expected, present in fields:
@@ -599,6 +643,7 @@ def _build_engine(
     shutdown_event: Event,
     subtask_sequence_contract: SubtaskSequenceContract | None = None,
     subtask_time_enabled: bool = False,
+    memory_progress_assist: NeroEggMemoryProgressAssist | None = None,
 ) -> RTCInferenceEngine:
     cfg.rtc.enabled = True
     if hasattr(policy.config, "rtc_config"):
@@ -619,6 +664,7 @@ def _build_engine(
         shutdown_event=shutdown_event,
         subtask_sequence_contract=subtask_sequence_contract,
         subtask_time_enabled=subtask_time_enabled,
+        memory_progress_assist=memory_progress_assist,
     )
 
 
@@ -760,6 +806,10 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
     dataset_features = _build_dataset_features(
         robot, robot_action_processor, robot_observation_processor, use_videos=use_videos
     )
+    if dataset_meta is not None:
+        _check_metadata_compatibility(dataset_meta, robot.robot_type, dataset_fps, dataset_features)
+    else:
+        _check_policy_compatibility(cfg.policy, dataset_features)
 
     shutdown_event = Event()
     listener = None
@@ -786,13 +836,14 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             checkpoint_enabled=checkpoint_subtask_time_enabled,
             effective_enabled=effective_subtask_time_enabled,
         )
+        memory_progress_assist = _make_nero_egg_memory_progress_assist(
+            cfg.dataset,
+            cfg.policy,
+            enabled=cfg.nero_egg_memory_progress_assist,
+        )
 
         robot.connect()
         robot_wrapper = ThreadSafeRobot(robot)
-        if dataset_meta is not None:
-            _check_metadata_compatibility(dataset_meta, robot_wrapper.robot_type, dataset_fps, dataset_features)
-        else:
-            _check_policy_compatibility(cfg.policy, dataset_features)
 
         engine = _build_engine(
             cfg,
@@ -805,6 +856,7 @@ def policy_deploy(cfg: PolicyDeployConfig) -> None:
             shutdown_event,
             subtask_sequence_contract=subtask_sequence_contract,
             subtask_time_enabled=effective_subtask_time_enabled,
+            memory_progress_assist=memory_progress_assist,
         )
         engine.start()
         engine.pause()

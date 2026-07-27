@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from lerobot.value_function.configuration import ValueFunctionConfig
 from lerobot.value_function.dataset import (
@@ -63,6 +64,8 @@ class ValueTrainingConfig:
     seed: int = 42
     device: str = "auto"
     log_every_steps: int = 50
+    progress: bool = True
+    save_every_epoch: bool = True
     progress_bins: int = 10
     augmentation: ValueAugmentationConfig = field(default_factory=ValueAugmentationConfig)
 
@@ -83,8 +86,10 @@ class ValueTrainingConfig:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError("warmup_ratio must be in [0, 1]")
-        if self.max_grad_norm < 0 or self.progress_bins < 1:
-            raise ValueError("max_grad_norm must be non-negative and progress_bins positive")
+        if self.max_grad_norm < 0 or self.progress_bins < 1 or self.log_every_steps < 1:
+            raise ValueError(
+                "max_grad_norm must be non-negative and progress_bins/log_every_steps positive"
+            )
 
 
 def _set_seed(seed: int) -> None:
@@ -128,6 +133,20 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
         os.replace(temp_name, path)
     finally:
         Path(temp_name).unlink(missing_ok=True)
+
+
+def _atomic_hardlink(source: Path, target: Path) -> None:
+    """Atomically make target a hard link to source without duplicating checkpoint storage."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.unlink()
+    try:
+        os.link(source, temp_path)
+        os.replace(temp_path, target)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -375,6 +394,11 @@ def _run_loader(
     progress_bins: int,
     subtask_order: Sequence[str],
     remaining_steps: int | None,
+    epoch: int,
+    epochs: int,
+    phase: str,
+    show_progress: bool,
+    log_every_steps: int,
 ) -> tuple[dict[str, Any], int]:
     training = optimizer is not None
     model.train(training)
@@ -385,7 +409,19 @@ def _run_loader(
         subtask_order=subtask_order,
     )
     steps = 0
-    for batch in loader:
+    progress_total = len(loader)
+    if remaining_steps is not None:
+        progress_total = min(progress_total, max(remaining_steps, 0))
+    progress = tqdm(
+        loader,
+        total=progress_total,
+        desc=f"Epoch {epoch}/{epochs} {phase}",
+        unit="batch",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not show_progress,
+    )
+    for batch in progress:
         if remaining_steps is not None and steps >= remaining_steps:
             break
         batch = _move_batch(batch, device)
@@ -406,7 +442,38 @@ def _run_loader(
                     scheduler.step()
         accumulator.update(outputs, losses, batch)
         steps += 1
+        if steps == 1 or steps % log_every_steps == 0 or steps == progress_total:
+            postfix: dict[str, str] = {
+                "loss": f"{accumulator.loss_sums['loss'] / accumulator.count:.4f}",
+            }
+            if mode in {"subtask", "both"}:
+                postfix["acc"] = f"{accumulator.subtask_correct / accumulator.count:.3f}"
+            if training:
+                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+            progress.set_postfix(postfix, refresh=False)
+    progress.close()
     return accumulator.finalize(), steps
+
+
+def _epoch_summary(
+    *,
+    epoch: int,
+    epochs: int,
+    step: int,
+    train_metrics: Mapping[str, Any],
+    val_metrics: Mapping[str, Any],
+) -> str:
+    fields = [f"Epoch {epoch}/{epochs} complete", f"step={step}"]
+    train_loss = train_metrics.get("losses", {}).get("loss")
+    val_loss = val_metrics.get("losses", {}).get("loss")
+    val_accuracy = val_metrics.get("subtask_accuracy")
+    if train_loss is not None:
+        fields.append(f"train_loss={train_loss:.4f}")
+    if val_loss is not None:
+        fields.append(f"val_loss={val_loss:.4f}")
+    if val_accuracy is not None:
+        fields.append(f"val_acc={val_accuracy:.3f}")
+    return " | ".join(fields)
 
 
 def _model_checkpoint_payload(
@@ -558,12 +625,16 @@ def train_value_function(
                 "std": state_std.tolist() if state_std is not None else None,
             },
             "checkpoint": "checkpoint.pt",
+            "epoch_checkpoints": (
+                "checkpoints/checkpoint_epoch_*.pt" if config.save_every_epoch else None
+            ),
             "metrics": "train_metrics.jsonl",
         },
     )
 
     global_step = 0
     final_record: dict[str, Any] = {}
+    epoch_checkpoints: list[str] = []
     for epoch in range(1, config.epochs + 1):
         remaining = None if config.max_steps is None else config.max_steps - global_step
         if remaining is not None and remaining <= 0:
@@ -580,6 +651,11 @@ def train_value_function(
             progress_bins=config.progress_bins,
             subtask_order=dataset.subtask_order,
             remaining_steps=remaining,
+            epoch=epoch,
+            epochs=config.epochs,
+            phase="train",
+            show_progress=config.progress,
+            log_every_steps=config.log_every_steps,
         )
         global_step += steps
         with torch.inference_mode():
@@ -595,6 +671,11 @@ def train_value_function(
                 progress_bins=config.progress_bins,
                 subtask_order=dataset.subtask_order,
                 remaining_steps=None,
+                epoch=epoch,
+                epochs=config.epochs,
+                phase="val",
+                show_progress=config.progress,
+                log_every_steps=config.log_every_steps,
             )
         final_record = {
             "created_at": iso_utc_now(),
@@ -619,7 +700,25 @@ def train_value_function(
             step=global_step,
             metrics=final_record,
         )
-        _atomic_torch_save(output_dir / "checkpoint.pt", checkpoint_payload)
+        if config.save_every_epoch:
+            epoch_checkpoint = (
+                output_dir / "checkpoints" / f"checkpoint_epoch_{epoch:03d}.pt"
+            )
+            _atomic_torch_save(epoch_checkpoint, checkpoint_payload)
+            _atomic_hardlink(epoch_checkpoint, output_dir / "checkpoint.pt")
+            epoch_checkpoints.append(str(epoch_checkpoint))
+        else:
+            _atomic_torch_save(output_dir / "checkpoint.pt", checkpoint_payload)
+        if config.progress:
+            tqdm.write(
+                _epoch_summary(
+                    epoch=epoch,
+                    epochs=config.epochs,
+                    step=global_step,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                )
+            )
         if config.max_steps is not None and global_step >= config.max_steps:
             break
 
@@ -628,6 +727,7 @@ def train_value_function(
     return {
         "output_dir": str(output_dir),
         "checkpoint": str(output_dir / "checkpoint.pt"),
+        "epoch_checkpoints": epoch_checkpoints,
         "steps": global_step,
         "train_frames": len(train_indices),
         "val_frames": len(val_indices),

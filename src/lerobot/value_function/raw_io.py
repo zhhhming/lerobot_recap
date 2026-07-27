@@ -24,12 +24,18 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
+from lerobot.datasets.raw_media import (
+    RawImageEncoding,
+    camera_subdir_name as _camera_subdir_name,
+    make_raw_image_encoding,
+    raw_frame_image_path,
+    validate_raw_format_version,
+)
 from lerobot.value_function.schema import (
     EPISODE_DIR_PREFIX,
     EXTRAS_FILENAME,
     FRAMES_FILENAME,
     PIPELINE_SCHEMA_VERSION,
-    RAW_FORMAT_VERSION,
     RUN_META_FILENAME,
     VALUE_FUNCTION_META_FILENAME,
 )
@@ -55,11 +61,7 @@ def read_run_meta(root: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Missing {RUN_META_FILENAME} in {root}")
     with open(meta_path) as f:
         meta = json.load(f)
-    version = meta.get("version", RAW_FORMAT_VERSION)
-    if version != RAW_FORMAT_VERSION:
-        raise ValueError(
-            f"Raw format version mismatch in {root}: expected {RAW_FORMAT_VERSION}, got {version}"
-        )
+    validate_raw_format_version(meta, root)
     return meta
 
 
@@ -88,9 +90,7 @@ def discover_episodes(root: str | Path) -> list[RawEpisode]:
         match = EPISODE_DIR_RE.match(path.name)
         if match is None:
             continue
-        episodes.append(
-            RawEpisode(index=int(match.group(1)), path=path, frame_count=get_frame_count(path))
-        )
+        episodes.append(RawEpisode(index=int(match.group(1)), path=path, frame_count=get_frame_count(path)))
     if not episodes:
         raise ValueError(f"No raw episodes found in {root}")
     episodes.sort(key=lambda ep: ep.index)
@@ -103,17 +103,24 @@ def get_image_keys(run_meta: Mapping[str, Any]) -> list[str]:
 
 
 def camera_subdir_name(image_key: str) -> str:
-    return image_key.split(".")[-1]
+    return _camera_subdir_name(image_key)
 
 
 def frame_image_paths(
     episode_dir: str | Path,
     frame_index: int,
     image_keys: Sequence[str],
+    image_encoding: RawImageEncoding | None = None,
 ) -> dict[str, Path]:
     episode_dir = Path(episode_dir).expanduser().resolve()
+    encoding = image_encoding or make_raw_image_encoding("png")
     return {
-        image_key: episode_dir / camera_subdir_name(image_key) / f"{frame_index:06d}.png"
+        image_key: raw_frame_image_path(
+            episode_dir,
+            camera_subdir_name(image_key),
+            frame_index,
+            encoding,
+        )
         for image_key in image_keys
     }
 
@@ -251,8 +258,7 @@ def merge_raw_run_extras(
         missing = sorted(episode_indices - provided_indices)
         extra = sorted(provided_indices - episode_indices)
         raise ValueError(
-            "episode_columns must contain exactly one entry per episode: "
-            f"missing={missing}, extra={extra}"
+            f"episode_columns must contain exactly one entry per episode: missing={missing}, extra={extra}"
         )
 
     existing_schemas = []
@@ -303,9 +309,7 @@ def merge_raw_run_extras(
     destinations = {ep.index: ep.path / EXTRAS_FILENAME for ep in episodes}
     try:
         for ep in episodes:
-            staged[ep.index] = _write_parquet_temp(
-                prepared_tables[ep.index], destinations[ep.index]
-            )
+            staged[ep.index] = _write_parquet_temp(prepared_tables[ep.index], destinations[ep.index])
 
         for ep in episodes:
             destination = destinations[ep.index]
@@ -375,9 +379,7 @@ def normalize_stage_config(value: Any) -> Any:
         normalized: dict[str, Any] = {}
         for key in sorted(value, key=lambda item: str(item)):
             if not isinstance(key, str):
-                raise TypeError(
-                    f"Stage config mapping keys must be strings, got {type(key).__name__}"
-                )
+                raise TypeError(f"Stage config mapping keys must be strings, got {type(key).__name__}")
             normalized[key] = normalize_stage_config(value[key])
         return normalized
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -501,8 +503,7 @@ def _mark_stale_dependents(stages: dict[str, Any], changed_stage: str) -> None:
             if upstream_name not in dependencies:
                 continue
             dependency_is_stale = (
-                bool(upstream.get("stale"))
-                or dependencies[upstream_name] != upstream_fingerprint
+                bool(upstream.get("stale")) or dependencies[upstream_name] != upstream_fingerprint
             )
             if dependency_is_stale and not candidate.get("stale"):
                 updated = dict(candidate)
@@ -576,12 +577,9 @@ def assert_stage_dependencies_current(root: str | Path, stage_name: str) -> None
         raise ValueError(f"Missing pipeline stage metadata for '{stage_name}'")
     if record.get("stale"):
         raise StalePipelineArtifactError(
-            f"Pipeline stage '{stage_name}' is stale: "
-            f"{record.get('stale_reason', 'dependency changed')}"
+            f"Pipeline stage '{stage_name}' is stale: {record.get('stale_reason', 'dependency changed')}"
         )
-    current_input_fingerprint = fingerprint_raw_run_columns(
-        root, list(record.get("input_columns") or [])
-    )
+    current_input_fingerprint = fingerprint_raw_run_columns(root, list(record.get("input_columns") or []))
     if current_input_fingerprint != record.get("input_fingerprint"):
         raise StalePipelineArtifactError(
             f"Pipeline stage '{stage_name}' inputs changed; rerun '{stage_name}'"
@@ -596,14 +594,9 @@ def assert_stage_dependencies_current(root: str | Path, stage_name: str) -> None
             )
     for dependency, expected in (record.get("dependencies") or {}).items():
         upstream = _stage_record(metadata, dependency)
-        if (
-            upstream is None
-            or upstream.get("stale")
-            or upstream.get("stage_fingerprint") != expected
-        ):
+        if upstream is None or upstream.get("stale") or upstream.get("stage_fingerprint") != expected:
             raise StalePipelineArtifactError(
-                f"Pipeline stage '{stage_name}' has stale dependency '{dependency}'; "
-                f"rerun '{stage_name}'"
+                f"Pipeline stage '{stage_name}' has stale dependency '{dependency}'; rerun '{stage_name}'"
             )
 
 

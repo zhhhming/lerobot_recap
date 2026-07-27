@@ -27,7 +27,7 @@ def nero_left_cameras_config() -> dict[str, CameraConfig]:
 def nero_right_cameras_config() -> dict[str, CameraConfig]:
     return {
         "right_wrist": OrbbecCameraConfig(
-            serial_number_or_name="CP2R553000NZ",
+            serial_number_or_name="CP2R553000YD",
             width=640,
             height=480,
             fps=30,

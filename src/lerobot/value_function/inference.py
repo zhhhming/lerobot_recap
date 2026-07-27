@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from lerobot.value_function.configuration import ValueFunctionConfig
 from lerobot.value_function.dataset import (
@@ -68,6 +69,7 @@ class ValueInferenceConfig:
     subtask_inference_path: SubtaskInferencePath = "both"
     transition_penalty: float = 0.0
     allow_subtask_skip: bool = False
+    progress: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in {"global", "subtask", "both"}:
@@ -372,6 +374,7 @@ def _stage_config(
         "subtask_inference_path": config.subtask_inference_path,
         "transition_penalty": config.transition_penalty,
         "allow_subtask_skip": config.allow_subtask_skip,
+        "progress": config.progress,
     }
 
 
@@ -419,7 +422,14 @@ def infer_value_function(
     model.eval()
 
     records: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
-    with torch.inference_mode():
+    with torch.inference_mode(), tqdm(
+        total=len(dataset),
+        desc="Value inference",
+        unit="frame",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not config.progress,
+    ) as progress:
         for raw_batch in loader:
             batch = _move_batch(raw_batch, device)
             outputs = model(batch)
@@ -486,6 +496,7 @@ def infer_value_function(
                         }
                     )
                 records[int(episode_ids[index])].append(record)
+            progress.update(batch_size)
 
     episode_columns: dict[int, dict[str, pa.Array]] = {}
     for episode in dataset.episodes:

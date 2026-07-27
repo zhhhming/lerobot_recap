@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from lerobot.datasets.raw_media import raw_frame_image_path, raw_image_encoding_from_meta
 from lerobot.value_function.advantage_labeling import (
     AdvantageLabelingConfig,
     advantage_export_eligibility,
@@ -37,6 +38,7 @@ class RawRun:
         self.fps = int(self.meta.get("fps", 30))
         self.task = self.meta.get("task", "")
         self.robot_type = self.meta.get("robot_type", "")
+        self.image_encoding = raw_image_encoding_from_meta(self.meta)
         self.image_keys = get_image_keys(self.meta)
         self.cam_subdir = {key: key.split(".")[-1] for key in self.image_keys}
 
@@ -116,6 +118,21 @@ def paginated_preview(
         items = [item for item in items if item["preview_label"] == label_filter]
     total = len(items)
     total_pages = max(1, (total + page_size - 1) // page_size)
+    threshold_value = preview["threshold"]["threshold_value"]
+    threshold_indices = (
+        [
+            index
+            for index, item in enumerate(items)
+            if item["is_valid"] and item["advantage"] == threshold_value
+        ]
+        if threshold_value is not None
+        else []
+    )
+    threshold_page = (
+        threshold_indices[len(threshold_indices) // 2] // page_size + 1
+        if threshold_indices
+        else None
+    )
     if page > total_pages:
         page = total_pages
     start = (page - 1) * page_size
@@ -125,6 +142,7 @@ def paginated_preview(
         "page_size": page_size,
         "total": total,
         "total_pages": total_pages,
+        "threshold_page": threshold_page,
         "counts": preview["counts"],
         "threshold": preview["threshold"],
         "top_percent": preview["top_percent"],
@@ -319,11 +337,16 @@ class Handler(BaseHTTPRequestHandler):
         if cam not in set(self.run.cam_subdir.values()):
             self._send_bytes(b"Not found", "text/plain", status=404, cache=False)
             return
-        path = self.run.episode_dir(idx) / cam / f"{frame:06d}.png"
+        path = raw_frame_image_path(
+            self.run.episode_dir(idx),
+            cam,
+            frame,
+            self.run.image_encoding,
+        )
         if not path.is_file():
             self._send_bytes(b"Not found", "text/plain", status=404, cache=False)
             return
-        self._send_bytes(path.read_bytes(), "image/png", cache=True)
+        self._send_bytes(path.read_bytes(), self.run.image_encoding.mime_type, cache=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

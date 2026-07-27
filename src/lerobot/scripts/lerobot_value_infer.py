@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--transition_penalty", type=float, default=0.0)
     parser.add_argument("--allow_subtask_skip", type=_parse_bool, default=False)
+    parser.add_argument("--progress", type=_parse_bool, default=True)
     return parser
 
 
@@ -58,6 +59,7 @@ def main(argv: list[str] | None = None) -> dict:
             subtask_inference_path=args.subtask_inference_path,
             transition_penalty=args.transition_penalty,
             allow_subtask_skip=args.allow_subtask_skip,
+            progress=args.progress,
         )
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -66,4 +68,3 @@ def main(argv: list[str] | None = None) -> dict:
 
 if __name__ == "__main__":
     main()
-

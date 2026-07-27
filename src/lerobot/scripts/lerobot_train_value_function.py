@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log_every_steps", type=int, default=50)
+    parser.add_argument("--progress", type=_parse_bool, default=True)
+    parser.add_argument("--save_every_epoch", type=_parse_bool, default=True)
     parser.add_argument("--progress_bins", type=int, default=10)
 
     parser.add_argument("--augmentation", type=_parse_bool, default=True)
@@ -158,6 +160,8 @@ def main(argv: list[str] | None = None) -> dict:
         seed=args.seed,
         device=args.device,
         log_every_steps=args.log_every_steps,
+        progress=args.progress,
+        save_every_epoch=args.save_every_epoch,
         progress_bins=args.progress_bins,
         augmentation=augmentation,
     )

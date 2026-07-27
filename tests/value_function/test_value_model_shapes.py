@@ -8,6 +8,7 @@ from torch import nn
 
 from lerobot.value_function.configuration import DEFAULT_VALUE_IMAGE_KEYS, ValueFunctionConfig
 from lerobot.value_function.modeling_pi0_value import (
+    PaliGemmaValueBackbone,
     PI0ValueFunctionModel,
     decode_value_expectation,
     gather_subtask_head,
@@ -177,6 +178,20 @@ def test_use_state_false_does_not_require_state():
     del batch["observation.state"]
 
     assert model(batch)["global_remaining_logits"].shape == (3, 256)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_value_attention_mask_matches_language_model_dtype(dtype):
+    pad_masks = torch.tensor([[True, True, False]])
+
+    mask = PaliGemmaValueBackbone._attention_mask_4d(pad_masks, dtype=dtype)
+
+    assert mask.shape == (1, 1, 3, 3)
+    assert mask.dtype == dtype
+    assert mask.device == pad_masks.device
+    assert torch.isfinite(mask).all()
+    assert mask.max() == 0
+    assert mask.min() < -1e30
 
 
 def test_loss_rejects_fractional_and_out_of_range_subtask_ids():

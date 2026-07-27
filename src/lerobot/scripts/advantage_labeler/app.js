@@ -6,6 +6,7 @@ const state = {
   offset: 0,
   page: 1,
   totalPages: 1,
+  thresholdPage: null,
   pageSize: 150,
   overridesByMode: { global: {}, subtask: {} },
 };
@@ -15,7 +16,7 @@ const els = Object.fromEntries(
     "runMeta", "syntheticWarning", "valueMode", "sortOrder", "tiePolicy", "topPercent",
     "topPercentText", "exportBtn", "counts", "chunkList", "chunkTitle", "chunkDetails",
     "cameraSelect", "frameImage", "prevFrame", "nextFrame", "frameOffset", "status",
-    "clearOverride", "prevPage", "nextPage", "pageInfo",
+    "clearOverride", "prevPage", "nextPage", "thresholdPage", "pageInfo",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -77,6 +78,7 @@ async function refresh({ resetPage = false } = {}) {
   state.items = preview.items;
   state.page = preview.page;
   state.totalPages = preview.total_pages;
+  state.thresholdPage = preview.threshold_page;
   renderCounts(preview.counts);
   renderList();
   renderPagination();
@@ -113,6 +115,9 @@ function renderPagination() {
   els.pageInfo.textContent = `Page ${state.page} / ${state.totalPages}`;
   els.prevPage.disabled = state.page <= 1;
   els.nextPage.disabled = state.page >= state.totalPages;
+  els.thresholdPage.disabled = state.thresholdPage === null;
+  els.thresholdPage.textContent =
+    state.thresholdPage === null ? "No threshold" : `Threshold page ${state.thresholdPage}`;
 }
 
 function selectChunk(chunk, offset, element = state.selectedElement) {
@@ -184,6 +189,12 @@ async function main() {
   els.topPercent.addEventListener("input", debounce(() => refresh({ resetPage: true }), 150));
   els.prevPage.addEventListener("click", () => { state.page -= 1; refresh(); });
   els.nextPage.addEventListener("click", () => { state.page += 1; refresh(); });
+  els.thresholdPage.addEventListener("click", () => {
+    if (state.thresholdPage !== null) {
+      state.page = state.thresholdPage;
+      refresh();
+    }
+  });
   els.cameraSelect.addEventListener("change", () => state.selected && selectChunk(state.selected, state.offset));
   els.prevFrame.addEventListener("click", () => adjustOffset(-1));
   els.nextFrame.addEventListener("click", () => adjustOffset(1));

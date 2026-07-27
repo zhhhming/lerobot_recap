@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import lerobot.inference_engines.rtc as rtc_module
+from lerobot.inference_engines.memory_progress_assist import NeroEggMemoryProgressAssist
 from lerobot.inference_engines.rtc import RTCInferenceEngine
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor.memory_processor import MemoryConditionProcessorStep
@@ -134,6 +135,7 @@ def _make_engine(
     outputs: list[str | list[str]],
     use_memory: bool = True,
     generate_subtask: bool = True,
+    memory_progress_assist: NeroEggMemoryProgressAssist | None = None,
 ) -> tuple[RTCInferenceEngine, _FakePolicy, _FakePreprocessor, _FakePostprocessor]:
     policy = _FakePolicy(
         policy_type=policy_type,
@@ -154,6 +156,7 @@ def _make_engine(
         fps=30,
         device="cpu",
         rtc_queue_threshold=0,
+        memory_progress_assist=memory_progress_assist,
     )
     return engine, policy, preprocessor, postprocessor
 
@@ -416,3 +419,78 @@ def test_debug_snapshot_never_observes_torn_memory_commit() -> None:
         stop_reader.set()
         reader.join(timeout=3.0)
         engine.stop()
+
+
+def test_nero_egg_assist_changes_only_next_memory_after_successful_commit() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    frying_point_seven = "Subtask: Start frying the eggs.; Progress: 0.7"
+    frying_point_eight = "Subtask: Start frying the eggs.; Progress: 0.8"
+    assist = NeroEggMemoryProgressAssist(clock=clock)
+    engine, policy, _, _ = _make_engine(
+        outputs=[frying_point_seven, frying_point_seven, frying_point_seven],
+        memory_progress_assist=assist,
+    )
+
+    try:
+        _start_engine(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 1)
+        assert engine.debug_snapshot()["memory_text_for_next_inference"] == frying_point_seven
+
+        now = 6.0
+        _consume_committed_action(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 2)
+        forced = engine.debug_snapshot()
+        assert forced["last_subtask_output_text"] == frying_point_seven
+        assert forced["memory_text_for_next_inference"] == frying_point_eight
+        assert forced["memory_progress_assist_raw_progress"] == 0.7
+        assert forced["memory_progress_assist_effective_progress"] == 0.8
+        assert forced["memory_progress_assist_forced"] is True
+
+        _consume_committed_action(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 3)
+        assert policy.inputs[2]["memory_text"] == [frying_point_eight]
+        assert policy.inputs[2]["task"][0] == f"main task\nMemory: {frying_point_eight}"
+    finally:
+        engine.stop()
+
+
+def test_nero_egg_assist_is_cleared_by_soft_pause() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    output = "Subtask: Start frying the eggs.; Progress: 0.7"
+    assist = NeroEggMemoryProgressAssist(clock=clock)
+    engine, _, _, _ = _make_engine(outputs=[output, output], memory_progress_assist=assist)
+
+    try:
+        _start_engine(engine)
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 1)
+        now = 10.0
+        engine.soft_pause()
+        paused = engine.debug_snapshot()
+        assert paused["memory_text_for_next_inference"] == ""
+        assert paused["memory_progress_assist_reason"] == "reset"
+
+        engine.notify_observation({"state": torch.zeros(2)})
+        engine.resume()
+        _wait_until(lambda: engine.debug_snapshot()["inference_count"] == 2)
+        resumed = engine.debug_snapshot()
+        assert resumed["memory_text_for_next_inference"] == output
+        assert resumed["memory_progress_assist_forced"] is False
+    finally:
+        engine.stop()
+
+
+def test_assist_rejects_memory_disabled_or_non_generating_policy() -> None:
+    assist = NeroEggMemoryProgressAssist()
+
+    with pytest.raises(ValueError, match="requires deployment memory updates"):
+        _make_engine(outputs=[""], use_memory=False, memory_progress_assist=assist)
+    with pytest.raises(ValueError, match="requires deployment memory updates"):
+        _make_engine(outputs=[""], generate_subtask=False, memory_progress_assist=assist)
